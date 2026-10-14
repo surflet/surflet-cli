@@ -1,0 +1,20 @@
+{
+  "sourceCommit": "e639f888629ca1ba6b5a6ca95e1b637b38d54ae1",
+  "source": "Surflet client extraction; no private repository URL is included.",
+  "files": {
+    "tsconfig.base.json": "da912189b3c29166409b12545c0f4327bfce2929bf49b84c5fdad49a5ad5b34f",
+    "LICENSE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+    "packages/core/package.json": "4c2f62b4e7e0d5b13efc544656f1c3d81a024635ab5862753c00b7dbad3c2c3c",
+    "packages/core/tsconfig.json": "cbce58ec34fabf2317af1f8fadafbf4e7d41f826198d3c88ea036f120dae3baa",
+    "packages/core/src/index.ts": "f7746e4f0c59d9402c71769eaaa03091747ba0e94de4adf72ca512748b43008f",
+    "packages/core/src/index.test.ts": "b381a60900b2712c507e7e88734bba1d6ef984053e9b647cd6c177bfc82a5e0d",
+    "apps/connector/package.json": "011db66c33dde0abf774d56b50bccb46dca7abaed3eac1a52960dd0329026874",
+    "apps/connector/tsconfig.json": "cbce58ec34fabf2317af1f8fadafbf4e7d41f826198d3c88ea036f120dae3baa",
+    "apps/connector/src/index.ts": "ca647c671d4346ae57cdc76106afb26fe3b96615649b010023597670d1aaaf0d",
+    "apps/connector/src/cli.ts": "13291f40bb8acad639b7b452c1834b662460dbd41b8d3e76ea3bc7e3d708681f",
+    "apps/connector/src/index.test.ts": "0b611cd05fd2e8a8e407f56efaff296f22bacf4c9d09609f875ffc36c5bfc3db",
+    "apps/reporter/package.json": "e4531fcf723d563018d69ad110de96785b797b72a0fd276160efd610cabd82d2",
+    "apps/reporter/tsconfig.json": "def3b4ef0860918618a1b5683184c15e74b6a797b35c3f58fc5f7d565d300861",
+    "apps/reporter/src/main.ts": "70168f90464e0cb1a7a342a5f0e65fd0992cb8c9e5f8fd67e6c56d1f0a02955e"
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "name": "@surflet/reporter",
+  "version": "0.2.0",
+  "type": "module",
+  "private": true,
+  "exports": {
+    "./bundle": "./dist/reporter.js"
+  },
+  "scripts": {
+    "build": "esbuild src/main.ts --bundle --minify --format=iife --platform=browser --outfile=dist/reporter.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@surflet/core": "workspace:*",
+    "html-to-image": "^1.11.13"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
+  }
+}

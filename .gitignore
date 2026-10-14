@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.env
+.env.*
+.surflet/
+.config/
+credentials-*.json
+logs/
+test-results/
+*.log
