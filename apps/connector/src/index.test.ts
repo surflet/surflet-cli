@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createServer, request as httpRequest } from 'node:http';
 import { once } from 'node:events';
 import { EventEmitter } from 'node:events';
@@ -10,10 +10,18 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { WebSocket, WebSocketServer } from 'ws';
 import { detectRevision, loadCredentials, saveCredentials, startShare } from './index.js';
+import * as publicReadiness from './public-ready.js';
 
 const closers: Array<() => Promise<void>> = [];
 afterEach(async () => {
-  await Promise.all(closers.splice(0).map((close) => close()));
+  try {
+    for (const close of closers.splice(0)) await close();
+  } finally {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  }
 });
 
 async function listen(server: ReturnType<typeof createServer>) {
@@ -111,6 +119,137 @@ async function fixtureService() {
   });
   return { base: await listen(server), calls, feedbackBodies };
 }
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+async function heartbeatFixture(
+  respond: (count: number, signal: AbortSignal) => Response | Promise<Response>,
+  options: { automaticRevision?: boolean; expiresIn?: number } = {},
+) {
+  const app = createServer((_request, response) => response.end('app ok'));
+  const appUrl = await listen(app);
+  const directory = await mkdtemp(join(tmpdir(), 'surflet-heartbeat-'));
+  closers.push(() => rm(directory, { recursive: true, force: true }));
+  // Keep real I/O running; only the connector's clock and scheduling are controlled.
+  vi.useFakeTimers({
+    toFake: ['Date', 'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'],
+  });
+  // Node's native AbortSignal.timeout bypasses fake timers. Preserve its abort contract.
+  vi.spyOn(AbortSignal, 'timeout').mockImplementation((milliseconds) => {
+    const controller = new AbortController();
+    setTimeout(
+      () => controller.abort(new DOMException('Timed out', 'TimeoutError')),
+      milliseconds,
+    ).unref();
+    return controller.signal;
+  });
+  const realFetch = globalThis.fetch;
+  const calls: string[] = [];
+  const revisions: string[] = [];
+  let active = 0;
+  let maxActive = 0;
+  let createdRevision: string | undefined;
+  const preview = {
+    id: 'preview-1',
+    workspaceId: 'workspace-1',
+    name: 'fixture',
+    port: 0,
+    revision: 'test',
+    mode: 'local',
+    status: 'starting',
+    targetUrl: null,
+    createdAt: new Date().toISOString(),
+    lastSeenAt: null,
+    feedbackCount: 0,
+    expiresAt: new Date(Date.now() + (options.expiresIn ?? 120_000)).toISOString(),
+  };
+  vi.stubGlobal('fetch', async (input: string | URL, init?: RequestInit) => {
+    const url = new URL(String(input));
+    if (url.origin !== 'http://control.test') return realFetch(input, init);
+    calls.push(url.pathname);
+    if (url.pathname === '/api/workspaces')
+      return Response.json({
+        workspace: { id: 'workspace-1', name: 'test', createdAt: preview.createdAt },
+        token: 'owner',
+      });
+    if (url.pathname === '/api/previews') {
+      createdRevision = JSON.parse(String(init?.body)).revision;
+      return Response.json({
+        preview: { ...preview, revision: createdRevision },
+        connectorToken: 'connector',
+        shareToken: 'viewer',
+        shareUrl: 'http://portal.test/p/preview-1#token=viewer',
+      });
+    }
+    if (url.pathname.endsWith('/heartbeat')) {
+      revisions.push(JSON.parse(String(init?.body)).revision);
+      active++;
+      maxActive = Math.max(maxActive, active);
+      try {
+        return await respond(revisions.length, init?.signal as AbortSignal);
+      } finally {
+        active--;
+      }
+    }
+    if (url.pathname.endsWith('/exchange')) return Response.json({ authorized: true });
+    if (url.pathname.endsWith('/tunnel') || url.pathname.endsWith('/stop'))
+      return Response.json({ preview });
+    throw new Error(`Unexpected control request: ${url.pathname}`);
+  });
+  const handle = await startShare({
+    server: 'http://control.test',
+    port: Number(new URL(appUrl).port),
+    mode: 'local',
+    configDir: directory,
+    reporterScript: '',
+    ...(options.automaticRevision ? {} : { revision: 'fixed-revision' }),
+  });
+  closers.unshift(() => handle.close());
+  const exchange = await proxyRequest(
+    `${handle.connectorUrl}/?__surflet_access=abcdefghijklmnopqrstuvwxyz`,
+  );
+  expect(exchange.status).toBe(302);
+  const cookie = exchange.cookies.map((value) => value.split(';', 1)[0]).join('; ');
+  return {
+    handle,
+    calls,
+    revisions,
+    createdRevision,
+    get maxActive() {
+      return maxActive;
+    },
+    probe: (path = '/') => proxyRequest(`${handle.connectorUrl}${path}`, cookie),
+  };
+}
+
+function proxyRequest(url: string, cookie = '') {
+  return new Promise<{ status: number; body: string; cookies: string[] }>((resolve, reject) => {
+    const request = httpRequest(url, { headers: { cookie }, agent: false }, (response) => {
+      let body = '';
+      response.on('data', (chunk) => {
+        body += chunk;
+      });
+      response.on('end', () =>
+        resolve({
+          status: response.statusCode ?? 0,
+          body,
+          cookies: response.headers['set-cookie'] ?? [],
+        }),
+      );
+    });
+    request.once('error', reject);
+    request.end();
+  });
+}
+
+const heartbeatOk = () => Response.json({ preview: {} });
+const stopPath = '/api/previews/preview-1/stop';
 
 describe('local connector', () => {
   it('keeps owner credentials scoped to their service URL', async () => {
@@ -346,6 +485,7 @@ describe('local connector', () => {
   });
 
   it('stops the preview when a ready Quick Tunnel exits', async () => {
+    vi.spyOn(publicReadiness, 'waitForQuickTunnel').mockResolvedValue();
     const app = createServer((_request, response) => response.end('ok'));
     const appUrl = await listen(app);
     const service = await fixtureService();
@@ -362,6 +502,7 @@ describe('local connector', () => {
       },
       kill: () => {
         killed = true;
+        queueMicrotask(() => child.emit('close', 0, 'SIGTERM'));
         return true;
       },
     });
@@ -384,6 +525,162 @@ describe('local connector', () => {
     ).toHaveLength(1);
     expect(killed).toBe(true);
     await handle.close();
+  });
+
+  it('waits for public readiness before publishing a Quick share and cancels pending startup', async () => {
+    const service = await fixtureService();
+    const dir = await mkdtemp(join(tmpdir(), 'surflet-startup-'));
+    closers.push(() => rm(dir, { recursive: true, force: true }));
+    const child = new EventEmitter() as ChildProcess;
+    const stderr = new PassThrough();
+    const kill = vi.fn(() => {
+      queueMicrotask(() => child.emit('close', 0, 'SIGTERM'));
+      return true;
+    });
+    Object.assign(child, { stdout: new PassThrough(), stderr, kill });
+    const spawnProcess = (() => {
+      queueMicrotask(() => stderr.write('INF https://startup.trycloudflare.com'));
+      return child;
+    }) as typeof spawn;
+    let entered!: () => void;
+    const waiting = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    let readinessSignal: AbortSignal | undefined;
+    vi.spyOn(publicReadiness, 'waitForQuickTunnel').mockImplementation(async (_url, signal) => {
+      readinessSignal = signal;
+      entered();
+      await new Promise<void>((_resolve, reject) => {
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+      });
+    });
+    const caller = new AbortController();
+    let published = false;
+    const sharing = startShare({
+      server: service.base,
+      port: 3000,
+      mode: 'quick',
+      revision: 'startup',
+      configDir: dir,
+      reporterScript: '',
+      spawnProcess,
+      signal: caller.signal,
+    });
+    void sharing.then(
+      () => {
+        published = true;
+      },
+      () => {},
+    );
+    try {
+      await waiting;
+      expect(published).toBe(false);
+      expect(service.calls).toContain('POST /api/previews/preview-1/heartbeat');
+      caller.abort();
+      await expect(sharing).rejects.toThrow();
+      expect(readinessSignal?.aborted).toBe(true);
+      expect(kill).toHaveBeenCalledWith('SIGTERM');
+      expect(service.calls.filter((call) => call.endsWith('/stop'))).toHaveLength(1);
+    } finally {
+      caller.abort();
+      await sharing.catch(() => undefined);
+    }
+  });
+
+  it('terminates a Quick Tunnel when its caller cancels before the URL is produced', async () => {
+    const service = await fixtureService();
+    const dir = await mkdtemp(join(tmpdir(), 'surflet-cancel-quick-'));
+    closers.push(() => rm(dir, { recursive: true, force: true }));
+    const child = new EventEmitter() as ChildProcess;
+    const kill = vi.fn(() => {
+      queueMicrotask(() => {
+        child.emit('exit', 0, 'SIGTERM');
+        child.emit('close', 0, 'SIGTERM');
+      });
+      return true;
+    });
+    Object.assign(child, { stdout: new PassThrough(), stderr: new PassThrough(), kill });
+    let spawned!: () => void;
+    const started = new Promise<void>((resolve) => {
+      spawned = resolve;
+    });
+    const spawnProcess = (() => {
+      spawned();
+      return child;
+    }) as typeof spawn;
+    const caller = new AbortController();
+    const sharing = startShare({
+      server: service.base,
+      port: 3000,
+      mode: 'quick',
+      revision: 'startup',
+      configDir: dir,
+      reporterScript: '',
+      spawnProcess,
+      signal: caller.signal,
+    });
+    void sharing.catch(() => undefined);
+    try {
+      await started;
+      caller.abort();
+      await expect(sharing).rejects.toThrow('cancelled');
+      expect(kill).toHaveBeenCalledWith('SIGTERM');
+      expect(service.calls.filter((call) => call.endsWith('/stop'))).toHaveLength(1);
+    } finally {
+      caller.abort();
+      await sharing.catch(() => undefined);
+    }
+  });
+
+  it('waits for an owned tunnel process and escalates when it ignores SIGTERM', async () => {
+    const service = await fixtureService();
+    const dir = await mkdtemp(join(tmpdir(), 'surflet-terminate-'));
+    closers.push(() => rm(dir, { recursive: true, force: true }));
+    vi.spyOn(publicReadiness, 'waitForQuickTunnel').mockResolvedValue();
+    let child: ChildProcess | undefined;
+    let closed = false;
+    const spawnProcess = ((
+      _command: string,
+      _args: readonly string[],
+      options: Parameters<typeof spawn>[2],
+    ) => {
+      child = spawn(
+        process.execPath,
+        [
+          '-e',
+          "process.on('SIGTERM',()=>{});process.stderr.write('https://ignore-term.trycloudflare.com\\n');setInterval(()=>{},1000)",
+        ],
+        options,
+      );
+      child.once('close', () => {
+        closed = true;
+      });
+      return child;
+    }) as typeof spawn;
+    let handle: Awaited<ReturnType<typeof startShare>> | undefined;
+    try {
+      handle = await startShare({
+        server: service.base,
+        port: 3000,
+        mode: 'quick',
+        revision: 'test',
+        configDir: dir,
+        reporterScript: '',
+        spawnProcess,
+      });
+      await handle.close();
+      expect(closed).toBe(true);
+      expect(child?.signalCode).toBe('SIGKILL');
+      expect(() => process.kill(child!.pid!, 0)).toThrow();
+      expect(service.calls.filter((call) => call.endsWith('/stop'))).toHaveLength(1);
+    } finally {
+      await handle?.close();
+      if (child && !closed) {
+        const done = once(child, 'close');
+        child.kill('SIGKILL');
+        await done;
+      }
+    }
   });
 
   it('routes the longest matching prefix to its selected loopback service', async () => {
@@ -446,7 +743,10 @@ describe('local connector', () => {
       stdout: new PassThrough(),
       stderr: new PassThrough(),
       killed: false,
-      kill: () => true,
+      kill: () => {
+        queueMicrotask(() => child.emit('close', 0, 'SIGTERM'));
+        return true;
+      },
     });
     const spawnProcess = (() => {
       queueMicrotask(() => child.emit('exit', 1, null));
@@ -465,5 +765,172 @@ describe('local connector', () => {
     expect(
       service.calls.filter((call) => call === 'POST /api/previews/preview-1/stop'),
     ).toHaveLength(1);
+  });
+
+  it.each([500, 503, 429, 408, 'reset', 'timeout'] as const)(
+    'recovers from one transient %s heartbeat failure inside the original lease',
+    async (failure) => {
+      const fixture = await heartbeatFixture((count, signal) => {
+        if (count !== 2) return heartbeatOk();
+        if (failure === 'reset') throw new TypeError('fetch failed: ECONNRESET');
+        if (failure === 'timeout')
+          return new Promise((_resolve, reject) => {
+            signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+          });
+        return Response.json({ error: 'temporary failure' }, { status: failure });
+      });
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(fixture.revisions).toHaveLength(2);
+      expect((await fixture.probe()).body).toBe('app ok');
+      await vi.advanceTimersByTimeAsync(failure === 'timeout' ? 20_000 : 10_000);
+      expect(fixture.revisions).toHaveLength(3);
+      expect(fixture.calls).not.toContain(stopPath);
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect((await fixture.probe()).body).toBe('app ok');
+      expect(fixture.maxActive).toBe(1);
+      expect(fixture.calls.filter((path) => path === '/api/previews')).toHaveLength(1);
+    },
+  );
+
+  it('closes exactly at the original 35s lease when all later heartbeats fail', async () => {
+    const fixture = await heartbeatFixture((count) =>
+      count === 1 ? heartbeatOk() : Response.json({ error: 'unavailable' }, { status: 503 }),
+    );
+    await vi.advanceTimersByTimeAsync(34_999);
+    expect(fixture.revisions).toHaveLength(4);
+    expect((await fixture.probe()).status).toBe(200);
+    expect(fixture.calls).not.toContain(stopPath);
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(fixture.probe()).rejects.toThrow();
+    await new Promise(setImmediate);
+    expect(fixture.calls.filter((path) => path === stopPath)).toHaveLength(1);
+  });
+
+  it.each([401, 403, 404, 409])('fails closed immediately on heartbeat HTTP %s', async (status) => {
+    const fixture = await heartbeatFixture((count) =>
+      count === 1 ? heartbeatOk() : Response.json({ error: 'revoked or expired' }, { status }),
+    );
+    await vi.advanceTimersByTimeAsync(10_000);
+    await expect(fixture.probe()).rejects.toThrow();
+    await new Promise(setImmediate);
+    expect(fixture.calls.filter((path) => path === stopPath)).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(fixture.revisions).toHaveLength(2);
+  });
+
+  it('serializes a slow heartbeat and aborts its timeout before retrying', async () => {
+    let pendingSignal: AbortSignal | undefined;
+    const fixture = await heartbeatFixture((count, signal) => {
+      if (count !== 2) return heartbeatOk();
+      pendingSignal = signal;
+      return new Promise((_resolve, reject) => {
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+      });
+    });
+    await vi.advanceTimersByTimeAsync(24_999);
+    expect(fixture.revisions).toHaveLength(2);
+    expect(pendingSignal?.aborted).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(pendingSignal?.aborted).toBe(true);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(fixture.revisions).toHaveLength(3);
+    expect(fixture.maxActive).toBe(1);
+    expect((await fixture.probe()).body).toBe('app ok');
+  });
+
+  it('shares concurrent close completion, aborts in-flight work and ignores late success', async () => {
+    const late = deferred<Response>();
+    let signal: AbortSignal | undefined;
+    const fixture = await heartbeatFixture((count, requestSignal) => {
+      if (count !== 2) return heartbeatOk();
+      signal = requestSignal;
+      return late.promise;
+    });
+    await vi.advanceTimersByTimeAsync(10_000);
+    let finished = false;
+    const first = fixture.handle.close();
+    first.then(() => {
+      finished = true;
+    });
+    expect(fixture.handle.close()).toBe(first);
+    expect(signal?.aborted).toBe(true);
+    await expect(fixture.probe()).rejects.toThrow();
+    expect(finished).toBe(false);
+    late.resolve(heartbeatOk());
+    await first;
+    expect(finished).toBe(true);
+    await vi.advanceTimersByTimeAsync(60_000);
+    await expect(fixture.probe()).rejects.toThrow();
+    expect(fixture.revisions).toHaveLength(2);
+    expect(fixture.calls.filter((path) => path === stopPath)).toHaveLength(1);
+  });
+
+  it('bounds a pending request by the remaining lease and never accepts success at expiry', async () => {
+    const late = deferred<Response>();
+    let signal: AbortSignal | undefined;
+    const fixture = await heartbeatFixture((count, requestSignal) => {
+      if (count === 1) return heartbeatOk();
+      if (count < 4) return Response.json({ error: 'unavailable' }, { status: 503 });
+      signal = requestSignal;
+      return late.promise;
+    });
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(signal?.aborted).toBe(false);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(signal?.aborted).toBe(true);
+    await expect(fixture.probe()).rejects.toThrow();
+    late.resolve(heartbeatOk());
+    await fixture.handle.close();
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(fixture.revisions).toHaveLength(4);
+    expect(fixture.calls.filter((path) => path === stopPath)).toHaveLength(1);
+  });
+
+  it('enforces fixed preview expiry even with successful heartbeats', async () => {
+    const fixture = await heartbeatFixture(heartbeatOk, { expiresIn: 25_000 });
+    await vi.advanceTimersByTimeAsync(24_999);
+    expect((await fixture.probe()).status).toBe(200);
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(fixture.probe()).rejects.toThrow();
+    await new Promise(setImmediate);
+    expect(fixture.calls).toContain(stopPath);
+  });
+
+  it('uses unknown when initial revision capture rejects before its internal catch', async () => {
+    vi.spyOn(process, 'cwd').mockImplementationOnce(() => {
+      throw new Error('cwd unavailable');
+    });
+    const fixture = await heartbeatFixture(heartbeatOk, { automaticRevision: true });
+    expect(fixture.createdRevision).toBe('unknown');
+    expect(fixture.revisions).toEqual(['unknown']);
+    expect((await fixture.probe()).status).toBe(200);
+  });
+
+  it('replaces a known revision with unknown when recurring capture rejects', async () => {
+    const repository = await mkdtemp(join(tmpdir(), 'surflet-heartbeat-revision-'));
+    closers.push(() => rm(repository, { recursive: true, force: true }));
+    await command(repository, 'init');
+    await command(
+      repository,
+      '-c',
+      'user.name=test',
+      '-c',
+      'user.email=test@example.test',
+      'commit',
+      '--allow-empty',
+      '-m',
+      'initial',
+    );
+    const cwd = vi.spyOn(process, 'cwd').mockReturnValue(repository);
+    const fixture = await heartbeatFixture(heartbeatOk, { automaticRevision: true });
+    expect(fixture.createdRevision).toMatch(/^[a-f0-9]{40}$/);
+    cwd.mockImplementationOnce(() => {
+      throw new Error('cwd unavailable');
+    });
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(fixture.revisions).toHaveLength(2);
+    expect(fixture.revisions[1]).toBe('unknown');
+    expect(JSON.parse((await fixture.probe('/__surflet/context')).body).revision).toBe('unknown');
+    expect(fixture.calls).not.toContain(stopPath);
   });
 });

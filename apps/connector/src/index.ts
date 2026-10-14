@@ -8,7 +8,7 @@ import {
   type IncomingMessage,
   type ServerResponse,
 } from 'node:http';
-import { spawn, type ChildProcess } from 'node:child_process';
+import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { dirname, join, resolve } from 'node:path';
 import { WebSocket, WebSocketServer } from 'ws';
@@ -17,6 +17,7 @@ import {
   MAX_FEEDBACK_BODY_BYTES,
   OFFLINE_AFTER_MS,
   SurfletClient,
+  ApiError,
   type CreatedPreview,
   type Preview,
   redactText,
@@ -31,6 +32,8 @@ import {
 const require = createRequire(import.meta.url);
 const MAX_HTML_BYTES = 2 * 1024 * 1024;
 const DEFAULT_SERVER = 'http://127.0.0.1:4504';
+
+import { waitForQuickTunnel } from './public-ready.js';
 
 function requestUrl(raw: string) {
   const path = raw.split(/[?#]/, 1)[0] ?? '/';
@@ -64,6 +67,7 @@ export interface ShareOptions {
   cloudflaredPath?: string;
   reporterScript?: string;
   spawnProcess?: typeof spawn;
+  signal?: AbortSignal;
 }
 export interface ShareHandle {
   preview: Preview;
@@ -751,17 +755,31 @@ class LocalProxy {
 function tunnelUrl(output: string) {
   return output.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/i)?.[0];
 }
-async function startQuick(binary: string, port: number, spawnProcess: typeof spawn) {
-  const child = spawnProcess(binary, ['tunnel', '--url', `http://127.0.0.1:${port}`], {
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
+async function startQuick(
+  binary: string,
+  port: number,
+  spawnProcess: typeof spawn,
+  signal: AbortSignal,
+) {
+  const child = trackTunnel(
+    spawnProcess(binary, ['tunnel', '--url', `http://127.0.0.1:${port}`], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }),
+  );
   let output = '';
+  let cancelled: (() => void) | undefined;
   try {
     const result = await new Promise<string>((resolve, reject) => {
       const timer = setTimeout(
         () => reject(new Error('Timed out waiting for Cloudflare Quick Tunnel')),
         30_000,
       );
+      cancelled = () => {
+        clearTimeout(timer);
+        reject(new DOMException('Quick Tunnel creation cancelled', 'AbortError'));
+      };
+      signal.addEventListener('abort', cancelled, { once: true });
+      if (signal.aborted) cancelled();
       const inspect = (chunk: Buffer) => {
         output = `${output}${chunk.toString()}`.slice(-8192);
         const url = tunnelUrl(output);
@@ -785,22 +803,95 @@ async function startQuick(binary: string, port: number, spawnProcess: typeof spa
     });
     return { child, url: result };
   } catch (error) {
-    terminate(child);
+    await terminate(child);
     throw error;
+  } finally {
+    if (cancelled) signal.removeEventListener('abort', cancelled);
   }
 }
-function terminate(child?: ChildProcess) {
-  if (child && !child.killed) child.kill('SIGTERM');
+const ownedTunnels = new WeakMap<
+  ChildProcess,
+  {
+    closed: Promise<void>;
+    done: boolean;
+    terminating?: Promise<void>;
+  }
+>();
+function trackTunnel(child: ChildProcess) {
+  const state = { closed: Promise.resolve(), done: false } as {
+    closed: Promise<void>;
+    done: boolean;
+    terminating?: Promise<void>;
+  };
+  state.closed = new Promise<void>((resolve) =>
+    child.once('close', () => {
+      state.done = true;
+      resolve();
+    }),
+  );
+  ownedTunnels.set(child, state);
+  return child;
+}
+function terminate(child?: ChildProcess): Promise<void> {
+  if (!child) return Promise.resolve();
+  const state = ownedTunnels.get(child);
+  if (!state) throw new Error('Untracked tunnel process');
+  if (state.done) return Promise.resolve();
+  state.terminating ??= (async () => {
+    const wait = async (milliseconds: number) => {
+      let timer: NodeJS.Timeout | undefined;
+      try {
+        return await Promise.race([
+          state.closed.then(() => true),
+          new Promise<boolean>((resolve) => {
+            timer = setTimeout(() => resolve(false), milliseconds);
+          }),
+        ]);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    };
+    child.kill('SIGTERM');
+    if (await wait(500)) return;
+    child.kill('SIGKILL');
+    if (!(await wait(2000))) throw new Error('Tunnel process did not exit after SIGKILL');
+  })();
+  return state.terminating;
+}
+
+function isPermanentHeartbeatError(error: unknown): boolean {
+  return (
+    error instanceof ApiError &&
+    error.status >= 400 &&
+    error.status < 500 &&
+    error.status !== 408 &&
+    error.status !== 429
+  );
+}
+
+async function resolveHeartbeatRevision(
+  explicitRevision?: string,
+  projectDir?: string,
+): Promise<string> {
+  if (explicitRevision !== undefined) return explicitRevision;
+  try {
+    const detected = await detectRevision(projectDir);
+    return detected || 'unknown';
+  } catch {
+    return 'unknown';
+  }
 }
 
 export async function startShare(options: ShareOptions): Promise<ShareHandle> {
+  options.signal?.throwIfAborted();
   assertPort(options.port);
   const routes = localRoutesSchema.parse(options.routes);
   const logFiles = logFilesSchema.parse(options.logFiles);
   const server = options.server.replace(/\/$/, '');
   const mode = options.mode ?? 'quick';
   const client = await workspaceClient(server, options.configDir);
-  let revision = options.revision ?? (await detectRevision(options.projectDir));
+  const revision = await resolveHeartbeatRevision(options.revision, options.projectDir);
+  options.signal?.throwIfAborted();
   const created: CreatedPreview = await client.createPreview({
     name: options.name ?? `localhost:${options.port}`,
     port: options.port,
@@ -810,13 +901,34 @@ export async function startShare(options: ShareOptions): Promise<ShareHandle> {
     routes,
   });
   const connectorClient = new SurfletClient(server, created.connectorToken);
+  const heartbeatRequest = (revision: string, signal?: AbortSignal) =>
+    connectorClient.request<{ preview: Preview }>(
+      `/api/previews/${encodeURIComponent(created.preview.id)}/heartbeat`,
+      {
+        method: 'POST',
+        body: { revision },
+        signal,
+      },
+    );
   let tunnel: ChildProcess | undefined;
   let closed = false;
+  let closePromise: Promise<void> | undefined;
   let lastHeartbeat = Date.now();
   let heartbeat: NodeJS.Timeout | undefined;
   let expiry: NodeJS.Timeout | undefined;
-  let leaseWatch: NodeJS.Timeout | undefined;
-  const active = () => !closed && Date.now() - lastHeartbeat <= OFFLINE_AFTER_MS;
+  let leaseTimer: NodeJS.Timeout | undefined;
+  let inFlightHeartbeat: Promise<void> | undefined;
+  const closeController = new AbortController();
+
+  const active = () => !closed && Date.now() - lastHeartbeat < OFFLINE_AFTER_MS;
+  const resetLeaseTimer = () => {
+    if (leaseTimer) clearTimeout(leaseTimer);
+    const remaining = Math.max(0, OFFLINE_AFTER_MS - (Date.now() - lastHeartbeat));
+    leaseTimer = setTimeout(() => {
+      if (!active()) void close().catch(() => undefined);
+    }, remaining);
+  };
+
   const proxy = new LocalProxy({
     preview: created.preview,
     client: connectorClient,
@@ -827,33 +939,59 @@ export async function startShare(options: ShareOptions): Promise<ShareHandle> {
     portalUrl: created.shareUrl.split('#', 1)[0] ?? created.shareUrl,
     active,
   });
-  const close = async () => {
-    if (closed) return;
-    closed = true;
-    if (heartbeat) clearInterval(heartbeat);
-    if (expiry) clearTimeout(expiry);
-    if (leaseWatch) clearInterval(leaseWatch);
-    terminate(tunnel);
-    await proxy.close();
-    await connectorClient.stopPreview(created.preview.id).catch(() => undefined);
+  const close = (): Promise<void> => {
+    if (closePromise) return closePromise;
+    closePromise = (async () => {
+      closed = true;
+      options.signal?.removeEventListener('abort', cancelStartup);
+      if (heartbeat) clearInterval(heartbeat);
+      if (expiry) clearTimeout(expiry);
+      if (leaseTimer) clearTimeout(leaseTimer);
+      closeController.abort();
+      await Promise.all([
+        proxy.close(),
+        terminate(tunnel),
+        connectorClient.stopPreview(created.preview.id).catch(() => undefined),
+      ]);
+      await inFlightHeartbeat?.catch(() => undefined);
+    })();
+    return closePromise;
   };
+  const cancelStartup = () => {
+    void close().catch(() => undefined);
+  };
+  options.signal?.addEventListener('abort', cancelStartup, { once: true });
   try {
+    options.signal?.throwIfAborted();
     await proxy.listen();
+    if (closed) throw new Error('Preview closed during startup');
     let connectorUrl: string;
     if (mode === 'local') connectorUrl = `http://127.0.0.1:${proxy.port}`;
     else if (mode === 'named') {
       const named = await connectorClient.provisionTunnel(created.preview.id, proxy.port);
+      if (closed) throw new Error('Preview closed during startup');
       connectorUrl = named.targetUrl;
-      tunnel = (options.spawnProcess ?? spawn)(
-        options.cloudflaredPath ?? 'cloudflared',
-        ['tunnel', 'run'],
-        { env: { ...process.env, TUNNEL_TOKEN: named.token }, stdio: ['ignore', 'pipe', 'pipe'] },
+      tunnel = trackTunnel(
+        (options.spawnProcess ?? spawn)(
+          options.cloudflaredPath ?? 'cloudflared',
+          ['tunnel', 'run'],
+          { env: { ...process.env, TUNNEL_TOKEN: named.token }, stdio: ['ignore', 'pipe', 'pipe'] },
+        ),
       );
     } else {
+      const spawnTunnel = ((
+        command: string,
+        args: readonly string[],
+        childOptions: SpawnOptions = {},
+      ) => {
+        tunnel = (options.spawnProcess ?? spawn)(command, args, childOptions);
+        return tunnel;
+      }) as typeof spawn;
       const quick = await startQuick(
         options.cloudflaredPath ?? 'cloudflared',
         proxy.port,
-        options.spawnProcess ?? spawn,
+        spawnTunnel,
+        closeController.signal,
       );
       tunnel = quick.child;
       connectorUrl = quick.url;
@@ -861,36 +999,67 @@ export async function startShare(options: ShareOptions): Promise<ShareHandle> {
     if (tunnel?.exitCode !== null && tunnel?.exitCode !== undefined)
       throw new Error('cloudflared exited before the preview became available');
     tunnel?.once('exit', () => {
-      if (!closed) void close();
+      if (!closed) void close().catch(() => undefined);
     });
     tunnel?.once('error', () => {
-      if (!closed) void close();
+      if (!closed) void close().catch(() => undefined);
     });
     proxy.setPublicOrigin(connectorUrl);
     await connectorClient.attachTunnel(created.preview.id, connectorUrl);
-    await connectorClient.heartbeat(created.preview.id, revision);
+    if (closed) throw new Error('Preview closed during startup');
+    await heartbeatRequest(
+      revision,
+      AbortSignal.any([closeController.signal, AbortSignal.timeout(15_000)]),
+    );
+    if (closed) throw new Error('Preview closed during startup');
     lastHeartbeat = Date.now();
+    resetLeaseTimer();
     const expires = Date.parse(created.preview.expiresAt) - Date.now();
     expiry = setTimeout(
       () => {
-        void close();
+        void close().catch(() => undefined);
       },
       Math.max(0, expires),
     );
     heartbeat = setInterval(() => {
-      void Promise.resolve(options.revision ?? detectRevision(options.projectDir))
-        .then((next) =>
-          connectorClient.heartbeat(created.preview.id, next).then(() => {
-            revision = next;
-            created.preview.revision = next;
-            lastHeartbeat = Date.now();
-          }),
-        )
-        .catch(() => close());
+      if (closed || inFlightHeartbeat) return;
+      inFlightHeartbeat = (async () => {
+        try {
+          const elapsed = Date.now() - lastHeartbeat;
+          if (closed || elapsed >= OFFLINE_AFTER_MS) {
+            void close().catch(() => undefined);
+            return;
+          }
+          const nextRevision = await resolveHeartbeatRevision(options.revision, options.projectDir);
+          const remainingLease = OFFLINE_AFTER_MS - (Date.now() - lastHeartbeat);
+          if (closed || remainingLease <= 0) {
+            if (!closed) void close().catch(() => undefined);
+            return;
+          }
+          const combinedSignal = AbortSignal.any([
+            closeController.signal,
+            AbortSignal.timeout(Math.min(15_000, remainingLease)),
+          ]);
+
+          await heartbeatRequest(nextRevision, combinedSignal);
+
+          if (closed || Date.now() - lastHeartbeat >= OFFLINE_AFTER_MS) {
+            if (!closed) void close().catch(() => undefined);
+            return;
+          }
+
+          created.preview.revision = nextRevision;
+          lastHeartbeat = Date.now();
+          resetLeaseTimer();
+        } catch (error) {
+          if (isPermanentHeartbeatError(error) || !active()) void close().catch(() => undefined);
+        } finally {
+          inFlightHeartbeat = undefined;
+        }
+      })();
     }, HEARTBEAT_INTERVAL_MS);
-    leaseWatch = setInterval(() => {
-      if (!active()) void close();
-    }, 1_000);
+    if (mode === 'quick') await waitForQuickTunnel(connectorUrl, closeController.signal);
+    if (!active()) throw new Error('Preview closed during startup');
     return {
       preview: { ...created.preview, targetUrl: connectorUrl, status: 'online' },
       shareUrl: created.shareUrl,
