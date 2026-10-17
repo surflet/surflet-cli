@@ -3,10 +3,17 @@ import {
   createPreviewSchema,
   localRoutesSchema,
   feedbackInputSchema,
+  feedbackListQuerySchema,
+  inspectPngDataUri,
   redactText,
   redactUrl,
   sanitizeFeedback,
 } from './index.js';
+
+const validPng =
+  'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
+const validPalettePng =
+  'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABAQMAAAAl21bKAAAABlBMVEX/AAAAAP9sof2OAAAACklEQVR4nGNgAAAAAgABSK+kcQAAAABJRU5ErkJggg==';
 
 describe('public wire boundaries', () => {
   it('rejects non-loopback-origin settings and unexpected fields at the contract boundary', () => {
@@ -35,6 +42,34 @@ describe('public wire boundaries', () => {
     expect(feedbackInputSchema.safeParse({ message: ' ', password: 'private' }).success).toBe(
       false,
     );
+    expect(feedbackInputSchema.safeParse({ message: 'Issue', screenshot: 'data:image/png;base64,AAAA' }).success).toBe(
+      false,
+    );
+    expect(feedbackInputSchema.safeParse({ message: 'Issue', screenshot: '' }).success).toBe(false);
+    expect(feedbackInputSchema.safeParse({ message: 'Issue', screenshot: validPng }).success).toBe(true);
+    expect(inspectPngDataUri(validPng)).toMatchObject({ width: 1, height: 1, interlace: 0 });
+    expect(inspectPngDataUri(validPalettePng)).toMatchObject({ colorType: 3, width: 1, height: 1 });
+    for (const damaged of [
+      `${validPng.slice(0, -5)}AAAAA`,
+      validPng.slice(0, -4),
+      `${validPng.slice(0, -2)}A=`,
+    ])
+      expect(inspectPngDataUri(damaged)).toBeUndefined();
+  });
+  it('bounds feedback paging and avoids accepting unrecognized query keys', () => {
+    expect(feedbackListQuerySchema.parse({})).toMatchObject({
+      limit: 50,
+      includeScreenshots: false,
+      includeEvidence: true,
+    });
+    expect(feedbackListQuerySchema.parse({ limit: '200', status: 'open', includeScreenshots: 'true' })).toMatchObject({
+      limit: 200,
+      status: 'open',
+      includeScreenshots: true,
+      includeEvidence: true,
+    });
+    for (const query of [{ limit: '0' }, { limit: '201' }, { cursor: 'not/a/cursor' }, { unknown: 'x' }])
+      expect(feedbackListQuerySchema.safeParse(query).success).toBe(false);
   });
   it('accepts only distinct explicit local route prefixes', () => {
     expect(localRoutesSchema.parse([{ path: '/api', port: 8000 }])).toEqual([

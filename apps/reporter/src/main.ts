@@ -22,6 +22,9 @@ const steps: string[] = [];
 let screenshot: string | undefined;
 let context: Context | undefined;
 let panelOpen = false;
+let screenshotGeneration = 0;
+let submitting = false;
+let opener: HTMLElement | null = null;
 
 function keep<T>(list: T[], value: T) {
   list.push(value);
@@ -121,19 +124,19 @@ form,.success{padding:19px 22px}label{display:block;font-size:12px;font-weight:6
 @media(max-width:500px){:host{right:16px;bottom:16px}.panel{max-height:85vh;overflow:auto}}
 </style>
 <button class="launcher" type="button" aria-label="Report feedback"><span class="dot"></span>Feedback <span style="opacity:.5">/</span> Surflet</button>
-<section class="panel hidden" role="dialog" aria-label="Send feedback">
+ <section class="panel hidden" role="dialog" aria-modal="true" aria-label="Send feedback" tabindex="-1">
  <header class="top"><div><div class="eyebrow">Shared local preview</div><h2>What should we improve?</h2></div><button class="close" type="button" aria-label="Close feedback">×</button></header>
  <form>
   <label for="message">Your feedback</label><textarea id="message" name="message" maxlength="4000" required placeholder="What happened? What did you expect?"></textarea>
   <label for="reporter">Your name <span class="optional">(optional)</span></label><input id="reporter" type="text" name="reporter" maxlength="80" autocomplete="off" placeholder="How should we address you?">
-  <div class="context"></div>
+  <div class="context" aria-live="polite">Connecting to preview…</div>
   <label class="check"><input id="include-screenshot" type="checkbox">Include a screenshot</label>
   <p class="note">Browser errors and recent clicks are included. Form fields and private elements are excluded from screenshots. Review the image before sending.</p>
   <button class="capture hidden" type="button">Capture screenshot</button><img class="image hidden" alt="Screenshot to include with feedback">
-  <p class="error" role="alert"></p>
+  <p class="error" role="alert"></p><button class="retry-context hidden" type="button">Retry connection</button>
   <div class="actions"><span class="brand">Feedback → your developer</span><button class="submit" type="submit">Send feedback</button></div>
  </form>
- <div class="success hidden"><h3>Feedback delivered.</h3><p>Your developer can read this report with the app version and browser context.</p><button class="submit done" type="button">Done</button></div>
+ <div class="success hidden"><h3>Feedback delivered.</h3><p>Your developer can read this report with the app version and browser context.</p><button class="submit done" type="button">Report another issue</button></div>
 </section>`;
 document.body.append(root);
 function element<T extends Element>(selector: string): T {
@@ -148,20 +151,57 @@ const image = element<HTMLImageElement>('.image');
 const captureButton = element<HTMLButtonElement>('.capture');
 const submitButton = element<HTMLButtonElement>('.submit');
 const alert = element<HTMLParagraphElement>('.error');
+const retryContext = element<HTMLButtonElement>('.retry-context');
 function openPanel(open: boolean) {
   panelOpen = open;
   element('.launcher').classList.toggle('hidden', open);
   element('.panel').classList.toggle('hidden', !open);
-  if (open) message.focus();
+  if (open) {
+    opener =
+      shadow.activeElement instanceof HTMLElement
+        ? shadow.activeElement
+        : document.activeElement instanceof HTMLElement
+          ? document.activeElement
+          : null;
+    message.focus();
+  } else {
+    opener?.focus();
+  }
 }
 element('.launcher').addEventListener('click', () => openPanel(true));
 element('.close').addEventListener('click', () => openPanel(false));
-element('.done').addEventListener('click', () => openPanel(false));
-root.addEventListener('keydown', (event) => {
+element('.done').addEventListener('click', () => {
+  form.reset();
+  screenshot = undefined;
+  image.removeAttribute('src');
+  image.classList.add('hidden');
+  element('.success').classList.add('hidden');
+  form.classList.remove('hidden');
+  openPanel(true);
+});
+shadow.addEventListener('keydown', (event) => {
+  if (!(event instanceof KeyboardEvent)) return;
   if (event.key === 'Escape' && panelOpen) openPanel(false);
+  if (event.key !== 'Tab' || !panelOpen) return;
+  const focusable = Array.from(
+    shadow.querySelectorAll<HTMLElement>(
+      'button:not([disabled]), textarea:not([disabled]), input:not([disabled])',
+    ),
+  ).filter((node) => !node.closest('.hidden'));
+  const first = focusable[0];
+  const last = focusable.at(-1);
+  if (!first || !last) return;
+  if (event.shiftKey && shadow.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && shadow.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
 });
 
 async function captureScreenshot() {
+  const generation = ++screenshotGeneration;
   captureButton.disabled = true;
   alert.textContent = '';
   try {
@@ -185,10 +225,12 @@ async function captureScreenshot() {
     });
     if (result.length > MAX_SCREENSHOT_LENGTH)
       throw new Error('This screenshot is too large. Send browser context without the image.');
+    if (generation !== screenshotGeneration || !includeScreenshot.checked) return;
     screenshot = result;
     image.src = result;
     image.classList.remove('hidden');
   } catch (error) {
+    if (generation !== screenshotGeneration || !includeScreenshot.checked) return;
     screenshot = undefined;
     image.classList.add('hidden');
     alert.textContent =
@@ -203,15 +245,38 @@ includeScreenshot.addEventListener('change', () => {
   captureButton.classList.toggle('hidden', !includeScreenshot.checked);
   if (includeScreenshot.checked) void captureScreenshot();
   else {
+    screenshotGeneration++;
     screenshot = undefined;
+    image.removeAttribute('src');
     image.classList.add('hidden');
   }
 });
 captureButton.addEventListener('click', () => {
   void captureScreenshot();
 });
+async function loadContext() {
+  retryContext.classList.add('hidden');
+  alert.textContent = '';
+  element('.context').textContent = 'Connecting to preview…';
+  try {
+    const response = await originalFetch('/__surflet/context', { credentials: 'same-origin' });
+    if (!response.ok) throw new Error('Preview unavailable');
+    const value = (await response.json()) as Context;
+    if (!value.previewId || !value.revision || !value.name) throw new Error('Preview returned incomplete context');
+    context = value;
+    element('.context').textContent =
+      `${context.name} · ${context.revision} · ${redactUrl(location.href)}`;
+  } catch {
+    context = undefined;
+    element('.context').textContent = 'Preview connection unavailable.';
+    alert.textContent = 'Preview connection unavailable. Retry, or return to the share page to report it.';
+    retryContext.classList.remove('hidden');
+  }
+}
+retryContext.addEventListener('click', () => void loadContext());
 form.addEventListener('submit', async (event) => {
   event.preventDefault();
+  if (submitting) return;
   if (!context) {
     alert.textContent = 'Preview connection is unavailable. Reload the page and try again.';
     return;
@@ -220,6 +285,7 @@ form.addEventListener('submit', async (event) => {
     alert.textContent = 'Capture and review the screenshot, or uncheck the screenshot option.';
     return;
   }
+  submitting = true;
   submitButton.disabled = true;
   alert.textContent = '';
   try {
@@ -255,7 +321,14 @@ form.addEventListener('submit', async (event) => {
       headers: { 'content-type': 'application/json', 'x-surflet-csrf': csrf },
       body: JSON.stringify(payload),
     });
-    const result = (await response.json()) as { feedback?: Feedback; error?: string };
+    const body = await response.text();
+    let result: { feedback?: Feedback; error?: string } = {};
+    try {
+      result = JSON.parse(body) as { feedback?: Feedback; error?: string };
+    } catch {
+      if (!response.ok)
+        throw new Error(`Feedback could not be sent (${response.status}). Please try again.`);
+    }
     if (!response.ok)
       throw new Error(result.error ?? 'Feedback could not be sent. Please try again.');
     form.classList.add('hidden');
@@ -263,16 +336,8 @@ form.addEventListener('submit', async (event) => {
   } catch (error) {
     alert.textContent = error instanceof Error ? error.message : 'Feedback could not be sent.';
   } finally {
+    submitting = false;
     submitButton.disabled = false;
   }
 });
-void originalFetch('/__surflet/context', { credentials: 'same-origin' })
-  .then(async (response) => {
-    if (!response.ok) throw new Error('Preview unavailable');
-    context = (await response.json()) as Context;
-    element('.context').textContent =
-      `${context.name} · ${context.revision} · ${redactUrl(location.href)}`;
-  })
-  .catch(() => {
-    alert.textContent = 'Preview connection unavailable. Reload to reconnect.';
-  });
+void loadContext();

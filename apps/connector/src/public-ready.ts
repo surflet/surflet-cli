@@ -6,7 +6,7 @@ const MAX_BODY_BYTES = 4 * 1024;
 
 class ReadinessError extends Error {
   constructor(host: string, detail: string) {
-    super(`Quick Tunnel readiness failed (${host}; ${detail})`);
+    super(`Public tunnel readiness failed (${host}; ${detail})`);
   }
 }
 
@@ -71,16 +71,15 @@ function retryableNetworkError(error: unknown) {
   );
 }
 
-function validateQuickTunnel(url: string) {
+function validatePublicTunnel(url: string) {
   let value: URL;
   try {
     value = new URL(url);
   } catch {
-    throw new Error('invalid Quick Tunnel URL');
+    throw new Error('invalid public tunnel URL');
   }
   if (
     value.protocol !== 'https:' ||
-    !/^[a-z0-9-]+\.trycloudflare\.com$/i.test(value.hostname) ||
     value.username ||
     value.password ||
     value.port ||
@@ -88,7 +87,7 @@ function validateQuickTunnel(url: string) {
     value.search ||
     value.hash
   )
-    throw new Error('invalid Quick Tunnel URL');
+    throw new Error('invalid public tunnel URL');
   return value;
 }
 
@@ -138,11 +137,14 @@ function requestSignal(parent: AbortSignal, ms: number) {
   };
 }
 
-/** Wait until a public Quick Tunnel reaches this connector's unauthenticated boundary. */
-export async function waitForQuickTunnel(url: string, signal: AbortSignal): Promise<void> {
-  const tunnel = validateQuickTunnel(url);
+/** Wait until an assigned public tunnel reaches this connector's unauthenticated boundary. */
+export async function waitForPublicTunnel(
+  url: string,
+  signal: AbortSignal,
+  started = Date.now(),
+): Promise<void> {
+  const tunnel = validatePublicTunnel(url);
   const host = tunnel.hostname;
-  const started = Date.now();
   let finalDetail = 'request timeout';
 
   for (;;) {
@@ -189,4 +191,28 @@ export async function waitForQuickTunnel(url: string, signal: AbortSignal): Prom
     if (left <= 0) throw new ReadinessError(host, finalDetail);
     await delay(Math.min(RETRY_DELAY_MS, left), signal);
   }
+}
+
+/** Quick Tunnels are provider generated hosts; keep their narrower validation at this boundary. */
+export async function waitForQuickTunnel(url: string, signal: AbortSignal): Promise<void> {
+  let value: URL;
+  try {
+    value = new URL(url);
+  } catch {
+    throw new Error('invalid Quick Tunnel URL');
+  }
+  if (
+    value.protocol !== 'https:' ||
+    !/^[a-z0-9-]+\.trycloudflare\.com$/i.test(value.hostname) ||
+    value.username ||
+    value.password ||
+    value.port ||
+    value.pathname !== '/' ||
+    value.search ||
+    value.hash
+  )
+    throw new Error('invalid Quick Tunnel URL');
+  const started = Date.now();
+  await delay(10_000, signal);
+  return waitForPublicTunnel(url, signal, started);
 }

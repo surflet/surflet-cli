@@ -4,6 +4,8 @@ export const HEARTBEAT_INTERVAL_MS = 10000;
 export const OFFLINE_AFTER_MS = 35000;
 export const MAX_SCREENSHOT_LENGTH = 1500000;
 export const MAX_FEEDBACK_BODY_BYTES = MAX_SCREENSHOT_LENGTH + 550000;
+export const MAX_SCREENSHOT_WIDTH = 1440;
+export const MAX_SCREENSHOT_HEIGHT = 1200;
 export const feedbackStatuses = ['open', 'in_progress', 'fixed', 'verified'] as const;
 export const tunnelModes = ['quick', 'named', 'local'] as const;
 export const localRouteSchema = z
@@ -90,6 +92,134 @@ export const backendErrorSchema = z
   })
   .strict();
 export type BackendError = z.infer<typeof backendErrorSchema>;
+
+export type PngInspection = {
+  bytes: Uint8Array;
+  width: number;
+  height: number;
+  bitDepth: number;
+  colorType: number;
+  interlace: number;
+  imageData: Uint8Array[];
+};
+
+const pngSignature = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+const pngCrc32 = (bytes: Uint8Array, start: number, end: number) => {
+  let crc = 0xffffffff;
+  for (let index = start; index < end; index += 1) {
+    crc ^= bytes[index]!;
+    for (let bit = 0; bit < 8; bit += 1) crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+};
+const readUint32 = (bytes: Uint8Array, offset: number) =>
+  ((bytes[offset]! << 24) |
+    (bytes[offset + 1]! << 16) |
+    (bytes[offset + 2]! << 8) |
+    bytes[offset + 3]!) >>>
+  0;
+const chunkName = (bytes: Uint8Array, offset: number) =>
+  String.fromCharCode(bytes[offset]!, bytes[offset + 1]!, bytes[offset + 2]!, bytes[offset + 3]!);
+const validPngFormat = (bitDepth: number, colorType: number) =>
+  (colorType === 0 && [1, 2, 4, 8, 16].includes(bitDepth)) ||
+  (colorType === 2 && [8, 16].includes(bitDepth)) ||
+  (colorType === 3 && [1, 2, 4, 8].includes(bitDepth)) ||
+  (colorType === 4 && [8, 16].includes(bitDepth)) ||
+  (colorType === 6 && [8, 16].includes(bitDepth));
+
+/** Browser-safe, bounded PNG structural validation. The service also validates inflated scanlines. */
+export const inspectPngDataUri = (value: string): PngInspection | undefined => {
+  const prefix = 'data:image/png;base64,';
+  const encoded = value.slice(prefix.length);
+  if (
+    value.length > MAX_SCREENSHOT_LENGTH ||
+    !value.startsWith(prefix) ||
+    !encoded ||
+    encoded.length % 4 !== 0 ||
+    !/^[A-Za-z0-9+/]+={0,2}$/.test(encoded)
+  )
+    return;
+  let binary: string;
+  try {
+    binary = atob(encoded);
+  } catch {
+    return;
+  }
+  if (btoa(binary) !== encoded) return;
+  const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+  if (bytes.length < pngSignature.length + 12 || pngSignature.some((byte, index) => bytes[index] !== byte))
+    return;
+  let offset = pngSignature.length;
+  let width = 0;
+  let height = 0;
+  let bitDepth = 0;
+  let colorType = 0;
+  let interlace = 0;
+  let sawHeader = false;
+  let sawImageData = false;
+  let finishedImageData = false;
+  let sawPalette = false;
+  const imageData: Uint8Array[] = [];
+  while (offset + 12 <= bytes.length) {
+    const length = readUint32(bytes, offset);
+    const typeOffset = offset + 4;
+    const dataOffset = typeOffset + 4;
+    const end = dataOffset + length;
+    if (end + 4 > bytes.length) return;
+    const name = chunkName(bytes, typeOffset);
+    if (readUint32(bytes, end) !== pngCrc32(bytes, typeOffset, end)) return;
+    if (!sawHeader) {
+      if (name !== 'IHDR' || length !== 13) return;
+      width = readUint32(bytes, dataOffset);
+      height = readUint32(bytes, dataOffset + 4);
+      bitDepth = bytes[dataOffset + 8]!;
+      colorType = bytes[dataOffset + 9]!;
+      interlace = bytes[dataOffset + 12]!;
+      if (
+        width < 1 ||
+        height < 1 ||
+        width > MAX_SCREENSHOT_WIDTH ||
+        height > MAX_SCREENSHOT_HEIGHT ||
+        !validPngFormat(bitDepth, colorType) ||
+        bytes[dataOffset + 10] !== 0 ||
+        bytes[dataOffset + 11] !== 0 ||
+        ![0, 1].includes(interlace)
+      )
+        return;
+      sawHeader = true;
+    } else if (name === 'PLTE') {
+      if (
+        sawImageData ||
+        sawPalette ||
+        ![2, 3, 6].includes(colorType) ||
+        length === 0 ||
+        length % 3 !== 0 ||
+        length > 768 ||
+        (colorType === 3 && length > 3 * 2 ** bitDepth)
+      )
+        return;
+      sawPalette = true;
+    } else if (name === 'IDAT') {
+      if (finishedImageData) return;
+      sawImageData = true;
+      imageData.push(bytes.slice(dataOffset, end));
+    } else if (name === 'IEND') {
+      if (
+        length !== 0 ||
+        !sawImageData ||
+        (colorType === 3 && !sawPalette) ||
+        end + 4 !== bytes.length
+      )
+        return;
+      return { bytes, width, height, bitDepth, colorType, interlace, imageData };
+    } else if ((bytes[typeOffset]! & 0x20) === 0) {
+      return;
+    }
+    if (sawImageData && name !== 'IDAT') finishedImageData = true;
+    offset = end + 4;
+  }
+};
+
 export const feedbackInputSchema = z
   .object({
     message: z.string().trim().min(1).max(4000),
@@ -108,13 +238,13 @@ export const feedbackInputSchema = z
     networkErrors: z.array(networkErrorSchema).max(20).default([]),
     steps: z.array(z.string().max(300)).max(20).default([]),
     backendErrors: z.array(backendErrorSchema).max(20).default([]),
-    screenshot: z
-      .string()
-      .max(MAX_SCREENSHOT_LENGTH)
-      .regex(/^data:image\/png;base64,[A-Za-z0-9+/=]+$/)
-      .optional(),
+    screenshot: z.string().max(MAX_SCREENSHOT_LENGTH).optional(),
   })
-  .strict();
+  .strict()
+  .superRefine((input, context) => {
+    if (input.screenshot !== undefined && !inspectPngDataUri(input.screenshot))
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ['screenshot'], message: 'Invalid PNG screenshot' });
+  });
 export type FeedbackInput = z.input<typeof feedbackInputSchema>;
 export type FeedbackPayload = z.output<typeof feedbackInputSchema>;
 export const updateFeedbackSchema = z
@@ -131,6 +261,17 @@ export const retestSchema = z
     revision: z.string().min(1).max(120).optional(),
   })
   .strict();
+
+export const feedbackListQuerySchema = z
+  .object({
+    limit: z.coerce.number().int().min(1).max(200).default(50),
+    cursor: z.string().min(1).max(512).regex(/^[A-Za-z0-9_-]+$/).optional(),
+    status: z.enum(feedbackStatuses).optional(),
+    includeScreenshots: z.enum(['true', 'false']).optional().transform((value) => value === 'true'),
+    includeEvidence: z.enum(['true', 'false']).optional().transform((value) => value !== 'false'),
+  })
+  .strict();
+export type FeedbackListQuery = z.output<typeof feedbackListQuerySchema>;
 
 export interface Workspace {
   id: string;
@@ -163,6 +304,11 @@ export interface Feedback extends FeedbackPayload {
   testedRevision: string;
   retestRevision: string;
   hasScreenshot?: boolean;
+  evidenceIncluded?: boolean;
+  consoleErrorCount?: number;
+  networkErrorCount?: number;
+  backendErrorCount?: number;
+  stepCount?: number;
 }
 export interface CreatedPreview {
   preview: Preview;
@@ -180,6 +326,18 @@ export interface CreatedWorkspace {
   workspace: Workspace;
   token: string;
 }
+export interface FeedbackListResponse {
+  feedback: Feedback[];
+  total: number;
+  nextCursor: string | null;
+}
+export type FeedbackListOptions = {
+  includeScreenshots?: boolean;
+  limit?: number;
+  cursor?: string;
+  status?: Feedback['status'];
+  includeEvidence?: boolean;
+};
 
 export function redactText(input: string): string {
   return input
@@ -307,9 +465,16 @@ export class SurfletClient {
       body: { ticket },
     });
   }
-  listFeedback(id: string, options?: { includeScreenshots?: boolean }) {
-    return this.request<{ feedback: Feedback[] }>(
-      `/api/previews/${encodeURIComponent(id)}/feedback${options?.includeScreenshots === false ? '?includeScreenshots=false' : ''}`,
+  listFeedback(id: string, options: FeedbackListOptions = {}) {
+    const query = new URLSearchParams();
+    if (options.includeScreenshots) query.set('includeScreenshots', 'true');
+    if (options.limit !== undefined) query.set('limit', String(options.limit));
+    if (options.cursor) query.set('cursor', options.cursor);
+    if (options.status) query.set('status', options.status);
+    if (options.includeEvidence === false) query.set('includeEvidence', 'false');
+    const suffix = query.size ? `?${query}` : '';
+    return this.request<FeedbackListResponse>(
+      `/api/previews/${encodeURIComponent(id)}/feedback${suffix}`,
     );
   }
   getFeedback(id: string, feedbackId: string) {

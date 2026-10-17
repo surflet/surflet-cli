@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { waitForQuickTunnel } from './public-ready.js';
+import { waitForPublicTunnel, waitForQuickTunnel } from './public-ready.js';
 
 const TUNNEL = 'https://ready-123.trycloudflare.com';
 const READY = '{"error":"Surflet access required"}';
@@ -18,6 +18,18 @@ afterEach(() => {
 });
 
 describe('waitForQuickTunnel', () => {
+  it('uses the same exact 401 boundary for an assigned named tunnel origin', async () => {
+    const fetch = vi.fn().mockResolvedValue(response(401, READY));
+    vi.stubGlobal('fetch', fetch);
+    await expect(
+      waitForPublicTunnel('https://preview-1.preview.example', new AbortController().signal),
+    ).resolves.toBeUndefined();
+    expect(fetch).toHaveBeenCalledWith(
+      new URL('https://preview-1.preview.example'),
+      expect.objectContaining({ redirect: 'manual', credentials: 'omit' }),
+    );
+  });
+
   it('retries temporary DNS failures until the protected connector denial is public', async () => {
     vi.useFakeTimers();
     const fetch = vi
@@ -27,7 +39,7 @@ describe('waitForQuickTunnel', () => {
       .mockResolvedValue(response(401, READY));
     vi.stubGlobal('fetch', fetch);
     const ready = waitForQuickTunnel(TUNNEL, new AbortController().signal);
-    await vi.advanceTimersByTimeAsync(4_000);
+    await vi.advanceTimersByTimeAsync(14_000);
     await expect(ready).resolves.toBeUndefined();
     expect(fetch).toHaveBeenCalledTimes(3);
     expect(fetch.mock.calls[0]?.[1]).toMatchObject({
@@ -53,7 +65,7 @@ describe('waitForQuickTunnel', () => {
       .mockResolvedValue(response(401, READY));
     vi.stubGlobal('fetch', fetch);
     const ready = waitForQuickTunnel(TUNNEL, new AbortController().signal);
-    await vi.advanceTimersByTimeAsync(2_000);
+    await vi.advanceTimersByTimeAsync(12_000);
     await expect(ready).resolves.toBeUndefined();
     expect(fetch).toHaveBeenCalledTimes(2);
     expect(cancelled).toBe(true);
@@ -91,11 +103,29 @@ describe('waitForQuickTunnel', () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
+  it('settles Quick Tunnel DNS for ten seconds before its first native request and remains cancellable', async () => {
+    vi.useFakeTimers();
+    const fetch = vi.fn().mockResolvedValue(response(401, READY));
+    vi.stubGlobal('fetch', fetch);
+    const waiting = waitForQuickTunnel(TUNNEL, new AbortController().signal);
+    await vi.advanceTimersByTimeAsync(9_999);
+    expect(fetch).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(waiting).resolves.toBeUndefined();
+    expect(fetch).toHaveBeenCalledTimes(1);
+
+    const controller = new AbortController();
+    const cancelled = waitForQuickTunnel(TUNNEL, controller.signal);
+    controller.abort();
+    await expect(cancelled).rejects.toMatchObject({ name: 'AbortError' });
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it('does not report ready when cancellation wins a response completion race', async () => {
     let resolve!: (value: Response) => void;
     vi.stubGlobal('fetch', vi.fn(() => new Promise<Response>((done) => (resolve = done))));
     const controller = new AbortController();
-    const pending = waitForQuickTunnel(TUNNEL, controller.signal);
+    const pending = waitForPublicTunnel(TUNNEL, controller.signal);
     controller.abort();
     resolve(response(401, READY));
     await expect(pending).rejects.toMatchObject({ name: 'AbortError' });
@@ -114,7 +144,7 @@ describe('waitForQuickTunnel', () => {
         'fetch',
         vi.fn().mockImplementation(() => (result instanceof Response ? Promise.resolve(result) : Promise.reject(result))),
       );
-      await expect(waitForQuickTunnel(TUNNEL, new AbortController().signal)).rejects.toThrow(expected);
+      await expect(waitForPublicTunnel(TUNNEL, new AbortController().signal)).rejects.toThrow(expected);
       vi.unstubAllGlobals();
     }
   });
@@ -152,7 +182,7 @@ describe('waitForQuickTunnel', () => {
     const hanging = { status: 401, headers: new Headers(), body } as Response;
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(hanging));
     const controller = new AbortController();
-    const pending = waitForQuickTunnel(TUNNEL, controller.signal);
+    const pending = waitForPublicTunnel(TUNNEL, controller.signal);
     const rejected = expect(pending).rejects.toMatchObject({ name: 'AbortError' });
     await vi.advanceTimersByTimeAsync(5_001);
     expect(cancelled).toBe(true);

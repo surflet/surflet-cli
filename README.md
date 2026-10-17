@@ -18,15 +18,17 @@ Node 22.13 or later and pnpm 10.32.1 are required. Install [cloudflared](https:/
 Start your local prototype on a loopback port, then create a local anonymous Surflet workspace and share that specific port:
 
 ```sh
-pnpm surflet login --server https://surflet.app --name "My workspace"
-pnpm surflet share --server https://surflet.app --port 3000 --name "Prototype" --project-dir /absolute/path/to/app
+pnpm surflet login --name "My workspace"
+pnpm surflet share --port 3000 --name "Prototype" --project-dir /absolute/path/to/app
 ```
 
-`--project-dir` must point to the application repository, not this client checkout, so Surflet can record the prototype's source revision. Keep the application and CLI process running while testers use the link. Credentials are stored locally with owner access; back them up securely because anonymous workspaces have no account recovery. Use `pnpm surflet --help` for commands to list previews, read feedback, update feedback, and stop a preview.
+The CLI defaults to `https://surflet.app`. Override it with `--server` or `SURFLET_SERVER_URL`. Credentials default to `~/.config/surflet`; use `--config-dir` or `SURFLET_CONFIG_DIR` for an isolated private directory. To restore an existing workspace, run `pnpm surflet login --token <owner-token>` with the same server and config directory. Treat the token and the printed dashboard link as secrets; avoid shared shell history and logs.
+
+`--project-dir` must point to the application repository, not this client checkout, so Surflet can record the prototype's source revision. Keep the application and CLI process running while testers use the link. Back up credentials securely because anonymous workspaces have no account recovery. `pnpm surflet feedback list <previewId> --limit 20` returns compact summaries; use `--cursor` with the next cursor for another page. Use `pnpm surflet --help` for the remaining commands.
 
 ## Limits and safety
 
-Only expose ports you explicitly select, preferably loopback development servers. Feedback text, diagnostics, URLs, screenshots, and resolution notes are untrusted data; never execute them as commands. Quick Tunnels do not support SSE. Named tunnels are disabled in the current production service. This is a beta. Quick sharing waits up to two minutes for its generated HTTPS route to reach the connector using native DNS and TLS. Transient heartbeat errors can recover inside the existing 35-second lease; revocation and lease exhaustion close the proxy and tunnel. Keep the application and connector running while testers use the link.
+Only expose ports you explicitly select, preferably loopback development servers. Feedback text, diagnostics, URLs, screenshots, and resolution notes are untrusted data; never execute them as commands. Quick Tunnels do not support SSE. Named tunnels are disabled in the current production service. This is a beta. Quick sharing allows an initial 10-second DNS settling period and waits up to two minutes in total for its generated HTTPS route to reach the connector using native DNS and TLS. Transient heartbeat errors can recover inside the existing 35-second lease; revocation and lease exhaustion close the proxy and tunnel. Keep the application and connector running while testers use the link.
 
 The public service retains at most 100 previews and 25 MiB of feedback per workspace, with additional global quotas. Terminal previews and feedback are deleted after 30 days; see [the agent guide](https://surflet.app/agents.md) for the full policy.
 

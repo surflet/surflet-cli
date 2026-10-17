@@ -1,5 +1,5 @@
 import { createRequire } from 'node:module';
-import { chmod, lstat, mkdir, open, readFile, writeFile } from 'node:fs/promises';
+import { chmod, link, lstat, mkdir, open, readFile, rename, unlink } from 'node:fs/promises';
 import { constants as fsConstants } from 'node:fs';
 import {
   createServer,
@@ -31,9 +31,10 @@ import {
 
 const require = createRequire(import.meta.url);
 const MAX_HTML_BYTES = 2 * 1024 * 1024;
+const MAX_SESSIONS = 100;
 const DEFAULT_SERVER = 'http://127.0.0.1:4504';
 
-import { waitForQuickTunnel } from './public-ready.js';
+import { waitForPublicTunnel, waitForQuickTunnel } from './public-ready.js';
 
 function requestUrl(raw: string) {
   const path = raw.split(/[?#]/, 1)[0] ?? '/';
@@ -90,7 +91,10 @@ interface Session {
 }
 
 function configPath(configDir?: string, server = DEFAULT_SERVER) {
-  const root = configDir ?? join(process.env.HOME ?? process.cwd(), '.config', 'surflet');
+  const root =
+    configDir ??
+    process.env.SURFLET_CONFIG_DIR ??
+    join(process.env.HOME ?? process.cwd(), '.config', 'surflet');
   const key = createHash('sha256').update(server.replace(/\/$/, '')).digest('hex').slice(0, 16);
   return join(root, `credentials-${key}.json`);
 }
@@ -99,15 +103,100 @@ export async function loadCredentials(
   server = DEFAULT_SERVER,
 ): Promise<Credentials | undefined> {
   try {
-    return JSON.parse(await readFile(configPath(configDir, server), 'utf8')) as Credentials;
-  } catch {
-    return undefined;
+    const value = JSON.parse(await readFile(configPath(configDir, server), 'utf8')) as unknown;
+    if (
+      !value ||
+      typeof value !== 'object' ||
+      typeof (value as Credentials).token !== 'string' ||
+      !(value as Credentials).token
+    )
+      throw new Error('credential file has no token');
+    return value as Credentials;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw new Error(
+      `Unable to read Surflet credentials at ${configPath(configDir, server)}: ${
+        error instanceof Error ? error.message : 'invalid file'
+      }. Move the file aside or restore it from a secure backup.`,
+    );
+  }
+}
+const enrollments = new Map<string, Promise<SurfletClient>>();
+async function credentialLock(file: string) {
+  const lock = `${file}.lock`;
+  const deadline = Date.now() + 10_000;
+  const owner = JSON.stringify({ pid: process.pid, token: randomBytes(16).toString('hex') });
+  const candidate = `${lock}.${process.pid}.${randomBytes(8).toString('hex')}.tmp`;
+  const prepared = await open(candidate, 'wx', 0o600);
+  try {
+    await prepared.writeFile(owner);
+    await prepared.sync();
+    await prepared.close();
+    for (;;) {
+      try {
+        // Publish the complete owner record atomically; a killed writer cannot
+        // leave an empty lock between exclusive creation and initialization.
+        await link(candidate, lock);
+        return async () => {
+          const current = await readFile(lock, 'utf8').catch(() => undefined);
+          if (current === owner) await unlink(lock).catch(() => undefined);
+        };
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+        try {
+          const current = JSON.parse(await readFile(lock, 'utf8')) as { pid?: unknown };
+          const pid =
+            typeof current.pid === 'number' && Number.isInteger(current.pid)
+              ? current.pid
+              : undefined;
+          let ownerDead = false;
+          if (pid) {
+            try {
+              process.kill(pid, 0);
+            } catch (ownerError) {
+              ownerDead = (ownerError as NodeJS.ErrnoException).code === 'ESRCH';
+            }
+          }
+          if (ownerDead) {
+            await unlink(lock);
+            continue;
+          }
+        } catch (lockError) {
+          if ((lockError as NodeJS.ErrnoException).code === 'ENOENT') continue;
+          if (lockError instanceof SyntaxError) {
+            const info = await lstat(lock).catch(() => undefined);
+            if (info?.isFile() && Date.now() - info.mtimeMs > 60_000) {
+              await unlink(lock).catch(() => undefined);
+              continue;
+            }
+          }
+        }
+        if (Date.now() >= deadline)
+          throw new Error(`Timed out waiting for Surflet credential enrollment lock: ${lock}`);
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    }
+  } finally {
+    await prepared.close().catch(() => undefined);
+    await unlink(candidate).catch(() => undefined);
   }
 }
 export async function saveCredentials(value: Credentials, configDir?: string) {
   const file = configPath(configDir, value.server);
   await mkdir(dirname(file), { recursive: true, mode: 0o700 });
-  await writeFile(file, JSON.stringify(value), { mode: 0o600 });
+  const temporary = `${file}.${process.pid}.${randomBytes(8).toString('hex')}.tmp`;
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    handle = await open(temporary, 'wx', 0o600);
+    await handle.writeFile(JSON.stringify(value));
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    await rename(temporary, file);
+  } finally {
+    await handle?.close().catch(() => undefined);
+    await unlink(temporary).catch(() => undefined);
+  }
   await chmod(file, 0o600);
 }
 export async function workspaceClient(
@@ -117,21 +206,49 @@ export async function workspaceClient(
 ) {
   const saved = await loadCredentials(configDir, server);
   if (saved?.token) return new SurfletClient(server, saved.token);
-  const anonymous = new SurfletClient(server);
-  const created = await anonymous.createWorkspace(name);
-  await saveCredentials(
-    {
-      token: created.token,
-      workspaceId: created.workspace.id,
-      name: created.workspace.name,
-      server,
-    },
-    configDir,
-  );
-  return new SurfletClient(server, created.token);
+  const file = configPath(configDir, server);
+  const existing = enrollments.get(file);
+  if (existing) return existing;
+  const enrollment = (async () => {
+    await mkdir(dirname(file), { recursive: true, mode: 0o700 });
+    const release = await credentialLock(file);
+    try {
+      const afterLock = await loadCredentials(configDir, server);
+      if (afterLock?.token) return new SurfletClient(server, afterLock.token);
+      const anonymous = new SurfletClient(server);
+      const created = await anonymous.createWorkspace(name);
+      await saveCredentials(
+        {
+          token: created.token,
+          workspaceId: created.workspace.id,
+          name: created.workspace.name,
+          server,
+        },
+        configDir,
+      );
+      return new SurfletClient(server, created.token);
+    } finally {
+      await release();
+    }
+  })();
+  enrollments.set(file, enrollment);
+  try {
+    return await enrollment;
+  } finally {
+    enrollments.delete(file);
+  }
 }
-export function getClient(options: { server: string; configDir?: string; workspaceName?: string }) {
-  return workspaceClient(options.server, options.configDir, options.workspaceName);
+export async function getClient(options: {
+  server: string;
+  configDir?: string;
+  workspaceName?: string;
+}) {
+  const saved = await loadCredentials(options.configDir, options.server);
+  if (!saved)
+    throw new Error(
+      'No Surflet credentials found. Start a share or run an explicit workspace enrollment before using read-only tools.',
+    );
+  return new SurfletClient(options.server, saved.token);
 }
 
 function assertPort(port: number) {
@@ -300,6 +417,7 @@ async function reporterBundle(provided?: string) {
 
 class LocalProxy {
   private readonly sessions = new Map<string, Session>();
+  private pendingSessions = 0;
   private readonly sockets = new Set<WebSocket>();
   private readonly connections = new Set<import('node:net').Socket>();
   private readonly upstreams = new Set<ClientRequest>();
@@ -348,6 +466,7 @@ class LocalProxy {
     for (const upstream of this.upstreams) upstream.destroy();
     for (const connection of this.connections) connection.destroy();
     this.sessions.clear();
+    this.pendingSessions = 0;
     if (!this.listening) return;
     this.listening = false;
     await new Promise<void>((resolve) => this.server.close(() => resolve()));
@@ -386,18 +505,42 @@ class LocalProxy {
     });
     response.end(JSON.stringify({ error: message }));
   }
-  private async exchange(response: ServerResponse, url: URL) {
+  private async exchange(request: IncomingMessage, response: ServerResponse, url: URL) {
     const ticket = url.searchParams.get('__surflet_access') ?? url.searchParams.get('ticket');
     if (!ticket || !this.input.active() || Date.parse(this.input.preview.expiresAt) <= Date.now())
       return this.reject(response);
+    this.pruneSessions();
+    const existingToken = cookieValue(request, this.cookieName);
+    const existing = existingToken ? this.sessions.get(existingToken) : undefined;
+    const reuseSession = Boolean(existing && existing.expiresAt > Date.now());
+    if (!reuseSession && this.sessions.size + this.pendingSessions >= MAX_SESSIONS)
+      return this.reject(response, 429, 'Too many active preview sessions');
+    if (!reuseSession) this.pendingSessions += 1;
     try {
       await this.input.client.exchangeAccess(this.input.preview.id, ticket);
     } catch {
       return this.reject(response);
+    } finally {
+      if (!reuseSession) this.pendingSessions -= 1;
     }
     if (response.destroyed) return;
     if (!this.input.active() || Date.parse(this.input.preview.expiresAt) <= Date.now())
       return this.reject(response, 409, 'Preview is no longer active');
+    const path = '/';
+    const secure = this.publicOrigin?.startsWith('https:') ? '; Secure' : '';
+    url.searchParams.delete('__surflet_access');
+    url.searchParams.delete('ticket');
+    const location =
+      url.pathname === '/__surflet/access' ? '/' : `${url.pathname}${url.search}${url.hash}`;
+    if (reuseSession) {
+      response.writeHead(302, {
+        location,
+        'cache-control': 'no-store',
+        'referrer-policy': 'no-referrer',
+      });
+      response.end();
+      return;
+    }
     const value = randomBytes(32).toString('base64url');
     const csrf = randomBytes(24).toString('base64url');
     const maxAge = Math.max(
@@ -405,12 +548,6 @@ class LocalProxy {
       Math.floor((Date.parse(this.input.preview.expiresAt) - Date.now()) / 1000),
     );
     this.sessions.set(value, { value, csrf, expiresAt: Date.now() + maxAge * 1000 });
-    const path = '/';
-    const secure = this.publicOrigin?.startsWith('https:') ? '; Secure' : '';
-    url.searchParams.delete('__surflet_access');
-    url.searchParams.delete('ticket');
-    const location =
-      url.pathname === '/__surflet/access' ? '/' : `${url.pathname}${url.search}${url.hash}`;
     response.writeHead(302, {
       location,
       'set-cookie': [
@@ -421,6 +558,11 @@ class LocalProxy {
       'referrer-policy': 'no-referrer',
     });
     response.end();
+  }
+  private pruneSessions() {
+    const now = Date.now();
+    for (const [token, session] of this.sessions)
+      if (session.expiresAt <= now) this.sessions.delete(token);
   }
   private csrf(request: IncomingMessage) {
     if (!this.originMatches(request)) return false;
@@ -477,7 +619,7 @@ class LocalProxy {
       (url.pathname === '/__surflet/access' || url.searchParams.has('__surflet_access')) &&
       request.method === 'GET'
     )
-      return void this.exchange(response, url);
+      return void this.exchange(request, response, url);
     if (!this.active(request)) return this.reject(response);
     if (url.pathname === '/__surflet/client.js' && request.method === 'GET') {
       response.writeHead(200, {
@@ -609,6 +751,16 @@ class LocalProxy {
     target.path = route.requestPath;
     const upstream = httpRequest(target, (app) => {
       app.once('error', () => response.destroy());
+      let htmlTimer: NodeJS.Timeout | undefined;
+      const stopHtmlTimer = () => {
+        if (htmlTimer) clearTimeout(htmlTimer);
+        htmlTimer = undefined;
+      };
+      response.once('close', () => {
+        stopHtmlTimer();
+        app.destroy();
+      });
+      app.once('error', stopHtmlTimer);
       const headers: Record<string, string | string[] | undefined> = Object.fromEntries(
         Object.entries(app.headers).map(([key, value]) => [
           key,
@@ -634,8 +786,9 @@ class LocalProxy {
         app.pipe(response);
         return;
       }
-      const size = Number(headers['content-length'] ?? 0);
-      if (!Number.isFinite(size) || size > MAX_HTML_BYTES) {
+      const length = headers['content-length'];
+      const size = typeof length === 'string' ? Number(length) : Number.NaN;
+      if (Number.isFinite(size) && (size < 0 || size > MAX_HTML_BYTES)) {
         headers['x-surflet-reporter'] = 'portal-fallback';
         response.writeHead(app.statusCode ?? 502, headers);
         app.pipe(response);
@@ -643,11 +796,32 @@ class LocalProxy {
       }
       const chunks: Buffer[] = [];
       let total = 0;
+      let fallback = false;
+      const streamFallback = () => {
+        if (fallback || response.destroyed) return;
+        fallback = true;
+        stopHtmlTimer();
+        headers['x-surflet-reporter'] = 'portal-fallback';
+        app.pause();
+        response.writeHead(app.statusCode ?? 502, headers);
+        if (chunks.length) response.write(Buffer.concat(chunks));
+        chunks.length = 0;
+        app.pipe(response);
+      };
+      htmlTimer = setTimeout(streamFallback, 100);
       app.on('data', (chunk) => {
+        if (fallback) return;
         total += chunk.length;
-        if (total <= MAX_HTML_BYTES) chunks.push(Buffer.from(chunk));
+        if (total <= MAX_HTML_BYTES) {
+          chunks.push(Buffer.from(chunk));
+          return;
+        }
+        chunks.push(Buffer.from(chunk));
+        streamFallback();
       });
       app.once('end', () => {
+        stopHtmlTimer();
+        if (fallback) return;
         if (total > MAX_HTML_BYTES) {
           response.writeHead(502, {
             'content-type': 'text/plain',
@@ -663,11 +837,14 @@ class LocalProxy {
         response.end(text);
       });
     });
+    response.once('close', () => upstream.destroy());
+    request.once('aborted', () => upstream.destroy());
     this.upstreams.add(upstream);
     const cleanup = () => this.upstreams.delete(upstream);
     upstream.once('close', cleanup);
     upstream.once('error', () => {
       cleanup();
+      if (response.destroyed || request.aborted) return;
       this.record(
         {
           service: 'proxy',
@@ -694,17 +871,59 @@ class LocalProxy {
     const requestedProtocols = Array.isArray(protocols)
       ? protocols
       : protocols?.split(',').map((v) => v.trim());
+    if (
+      requestedProtocols?.some(
+        (protocol) => !protocol || !/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(protocol),
+      )
+    ) {
+      socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+    const key = request.headers['sec-websocket-key'];
+    const version = request.headers['sec-websocket-version'];
+    const connection = request.headers.connection;
+    const validKey =
+      typeof key === 'string' &&
+      /^[A-Za-z0-9+/]{22}==$/.test(key) &&
+      Buffer.from(key, 'base64').byteLength === 16;
+    if (
+      request.headers.upgrade?.toLowerCase() !== 'websocket' ||
+      version !== '13' ||
+      !validKey ||
+      !connection
+        ?.toLowerCase()
+        .split(',')
+        .map((value) => value.trim())
+        .includes('upgrade')
+    ) {
+      socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
+      socket.destroy();
+      return;
+    }
     const upstreamHeaders = localTarget(route.port, request, [
       this.cookieName,
       `surflet_csrf_${this.input.preview.id}`,
       '__surflet_access',
     ]).headers;
     upstreamHeaders['x-surflet-request-id'] = this.requestId(request);
-    const upstream = new WebSocket(
-      `ws://127.0.0.1:${route.port}${route.requestPath}`,
-      requestedProtocols,
-      { headers: upstreamHeaders },
-    );
+    let upstream: WebSocket | undefined;
+    const downstreamGone = () => upstream?.terminate();
+    socket.once('close', downstreamGone);
+    socket.once('error', downstreamGone);
+    try {
+      upstream = new WebSocket(
+        `ws://127.0.0.1:${route.port}${route.requestPath}`,
+        requestedProtocols,
+        { headers: upstreamHeaders },
+      );
+    } catch {
+      socket.removeListener('close', downstreamGone);
+      socket.removeListener('error', downstreamGone);
+      socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
+      socket.destroy();
+      return;
+    }
     let upgraded = false;
     this.sockets.add(upstream);
     const fail = () => {
@@ -713,7 +932,7 @@ class LocalProxy {
         socket.write('HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n');
         socket.destroy();
       }
-      upstream.terminate();
+      upstream?.terminate();
     };
     upstream.once('error', fail);
     upstream.once('open', () => {
@@ -728,26 +947,30 @@ class LocalProxy {
         noServer: true,
         handleProtocols: () => upstream.protocol || false,
       });
-      wss.handleUpgrade(request, socket, head, (client) => {
-        upgraded = true;
-        this.sockets.add(client);
-        const close = () => {
-          client.terminate();
-          upstream.terminate();
-          this.sockets.delete(client);
-          this.sockets.delete(upstream);
-        };
-        client.on('message', (data, isBinary) => {
-          if (upstream.readyState === WebSocket.OPEN) upstream.send(data, { binary: isBinary });
+      try {
+        wss.handleUpgrade(request, socket, head, (client) => {
+          upgraded = true;
+          this.sockets.add(client);
+          const close = () => {
+            client.terminate();
+            upstream?.terminate();
+            this.sockets.delete(client);
+            this.sockets.delete(upstream!);
+          };
+          client.on('message', (data, isBinary) => {
+            if (upstream?.readyState === WebSocket.OPEN) upstream.send(data, { binary: isBinary });
+          });
+          upstream.on('message', (data, isBinary) => {
+            if (client.readyState === WebSocket.OPEN) client.send(data, { binary: isBinary });
+          });
+          client.once('close', close);
+          upstream.once('close', close);
+          client.once('error', close);
+          upstream.once('error', close);
         });
-        upstream.on('message', (data, isBinary) => {
-          if (client.readyState === WebSocket.OPEN) client.send(data, { binary: isBinary });
-        });
-        client.once('close', close);
-        upstream.once('close', close);
-        client.once('error', close);
-        upstream.once('error', close);
-      });
+      } catch {
+        fail();
+      }
     });
   }
 }
@@ -809,6 +1032,31 @@ async function startQuick(
     if (cancelled) signal.removeEventListener('abort', cancelled);
   }
 }
+function drainTunnelOutput(child: ChildProcess) {
+  child.stdout?.resume();
+  child.stderr?.resume();
+}
+async function waitForNamedTunnel(child: ChildProcess, url: string, signal: AbortSignal) {
+  drainTunnelOutput(child);
+  let cleanup = () => undefined;
+  const exited = new Promise<never>((_resolve, reject) => {
+    const failure = (detail: string) =>
+      reject(new Error(`cloudflared ${detail} before named tunnel became available`));
+    const error = () => failure('failed');
+    const exit = (code: number | null) => failure(`exited (${code ?? 'unknown'})`);
+    child.once('error', error);
+    child.once('exit', exit);
+    cleanup = () => {
+      child.removeListener('error', error);
+      child.removeListener('exit', exit);
+    };
+  });
+  try {
+    await Promise.race([waitForPublicTunnel(url, signal), exited]);
+  } finally {
+    cleanup();
+  }
+}
 const ownedTunnels = new WeakMap<
   ChildProcess,
   {
@@ -829,6 +1077,8 @@ function trackTunnel(child: ChildProcess) {
       resolve();
     }),
   );
+  // A spawn failure can arrive before startup installs its mode-specific handler.
+  child.on('error', () => undefined);
   ownedTunnels.set(child, state);
   return child;
 }
@@ -978,6 +1228,7 @@ export async function startShare(options: ShareOptions): Promise<ShareHandle> {
           { env: { ...process.env, TUNNEL_TOKEN: named.token }, stdio: ['ignore', 'pipe', 'pipe'] },
         ),
       );
+      drainTunnelOutput(tunnel);
     } else {
       const spawnTunnel = ((
         command: string,
@@ -1059,6 +1310,7 @@ export async function startShare(options: ShareOptions): Promise<ShareHandle> {
       })();
     }, HEARTBEAT_INTERVAL_MS);
     if (mode === 'quick') await waitForQuickTunnel(connectorUrl, closeController.signal);
+    if (mode === 'named') await waitForNamedTunnel(tunnel!, connectorUrl, closeController.signal);
     if (!active()) throw new Error('Preview closed during startup');
     return {
       preview: { ...created.preview, targetUrl: connectorUrl, status: 'online' },

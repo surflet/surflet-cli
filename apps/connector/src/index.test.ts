@@ -5,11 +5,19 @@ import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { gzipSync } from 'node:zlib';
-import { mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdtemp, readdir, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { WebSocket, WebSocketServer } from 'ws';
-import { detectRevision, loadCredentials, saveCredentials, startShare } from './index.js';
+import {
+  detectRevision,
+  getClient,
+  loadCredentials,
+  saveCredentials,
+  startShare,
+  workspaceClient,
+} from './index.js';
 import * as publicReadiness from './public-ready.js';
 
 const closers: Array<() => Promise<void>> = [];
@@ -42,9 +50,36 @@ async function command(directory: string, ...args: string[]) {
   });
 }
 
+function enrollmentChild(server: string, configDir: string) {
+  const connector = pathToFileURL(join(process.cwd(), 'apps/connector/dist/index.js')).href;
+  return spawn(
+    process.execPath,
+    [
+      '--input-type=module',
+      '-e',
+      `const { workspaceClient } = await import(${JSON.stringify(connector)}); await workspaceClient(process.argv[1], process.argv[2]);`,
+      server,
+      configDir,
+    ],
+    { stdio: 'ignore' },
+  );
+}
+
+async function enrollInChild(server: string, configDir: string) {
+  const child = enrollmentChild(server, configDir);
+  await new Promise<void>((resolve, reject) => {
+    child.once('error', reject);
+    child.once('close', (code) =>
+      code === 0 ? resolve() : reject(new Error(`child enrollment failed (${code ?? 'unknown'})`)),
+    );
+  });
+}
+
 async function fixtureService() {
   const calls: string[] = [];
   const feedbackBodies: Array<Record<string, unknown>> = [];
+  let exchangeHook: (() => Promise<void>) | undefined;
+  let workspaceHook: (() => Promise<void>) | undefined;
   let target = '';
   const preview = {
     id: 'preview-1',
@@ -68,7 +103,8 @@ async function fixtureService() {
       response.writeHead(code, { 'content-type': 'application/json' });
       response.end(JSON.stringify(value));
     };
-    if (request.url === '/api/workspaces' && request.method === 'POST')
+    if (request.url === '/api/workspaces' && request.method === 'POST') {
+      await workspaceHook?.();
       return send(
         {
           workspace: { id: 'workspace-1', name: 'test', createdAt: preview.createdAt },
@@ -76,6 +112,7 @@ async function fixtureService() {
         },
         201,
       );
+    }
     if (request.url === '/api/previews' && request.method === 'POST')
       return send(
         {
@@ -99,6 +136,7 @@ async function fixtureService() {
         JSON.parse(body).ticket !== 'abcdefghijklmnopqrstuvwxyz'
       )
         return send({ error: 'unauthorized' }, 401);
+      await exchangeHook?.();
       return send({ authorized: true });
     }
     if (request.url === '/api/previews/preview-1/feedback' && request.method === 'POST') {
@@ -110,6 +148,8 @@ async function fixtureService() {
       target = JSON.parse(body).targetUrl;
       return send({ preview });
     }
+    if (request.url === '/api/previews/preview-1/named-tunnel')
+      return send({ token: 'named-token', targetUrl: 'https://preview-1.preview.example' });
     if (
       request.url === '/api/previews/preview-1/heartbeat' ||
       request.url === '/api/previews/preview-1/stop'
@@ -117,7 +157,17 @@ async function fixtureService() {
       return send({ preview });
     return send({ error: 'not found' }, 404);
   });
-  return { base: await listen(server), calls, feedbackBodies };
+  return {
+    base: await listen(server),
+    calls,
+    feedbackBodies,
+    setExchangeHook: (hook?: () => Promise<void>) => {
+      exchangeHook = hook;
+    },
+    setWorkspaceHook: (hook?: () => Promise<void>) => {
+      workspaceHook = hook;
+    },
+  };
 }
 
 function deferred<T>() {
@@ -258,6 +308,109 @@ describe('local connector', () => {
     await saveCredentials({ token: 'two', server: 'http://two.test' }, dir);
     expect((await loadCredentials(dir, 'http://one.test'))?.token).toBe('one');
     expect((await loadCredentials(dir, 'http://two.test'))?.token).toBe('two');
+  });
+
+  it('uses SURFLET_CONFIG_DIR, writes private credentials atomically, and refuses unreadable saved auth', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'surflet-credentials-'));
+    const original = process.env.SURFLET_CONFIG_DIR;
+    process.env.SURFLET_CONFIG_DIR = dir;
+    try {
+      await saveCredentials({ token: 'saved', server: 'http://credentials.test' });
+      expect((await loadCredentials(undefined, 'http://credentials.test'))?.token).toBe('saved');
+      const files = await readdir(dir);
+      const credential = join(dir, files.find((file) => file.endsWith('.json'))!);
+      expect((await stat(credential)).mode & 0o777).toBe(0o600);
+      await writeFile(credential, '{');
+      await expect(getClient({ server: 'http://credentials.test' })).rejects.toThrow(
+        'Unable to read Surflet credentials',
+      );
+      await expect(getClient({ server: 'http://missing.test' })).rejects.toThrow(
+        'No Surflet credentials found',
+      );
+    } finally {
+      if (original === undefined) delete process.env.SURFLET_CONFIG_DIR;
+      else process.env.SURFLET_CONFIG_DIR = original;
+    }
+  });
+
+  it('serializes concurrent enrollment for one configuration directory', async () => {
+    const service = await fixtureService();
+    const dir = await mkdtemp(join(tmpdir(), 'surflet-enrollment-'));
+    const configDir = join(dir, 'private', 'credentials');
+    const [first, second] = await Promise.all([
+      workspaceClient(service.base, configDir, 'first'),
+      workspaceClient(service.base, configDir, 'second'),
+    ]);
+    expect(first).toBeDefined();
+    expect(second).toBeDefined();
+    expect(service.calls.filter((call) => call === 'POST /api/workspaces')).toHaveLength(1);
+  });
+
+  it('serializes fresh enrollment across separate connector processes', async () => {
+    const service = await fixtureService();
+    const dir = await mkdtemp(join(tmpdir(), 'surflet-cross-process-'));
+    const configDir = join(dir, 'credentials');
+    await Promise.all([
+      enrollInChild(service.base, configDir),
+      enrollInChild(service.base, configDir),
+    ]);
+    expect(service.calls.filter((call) => call === 'POST /api/workspaces')).toHaveLength(1);
+  });
+
+  it('recovers an enrollment lock after its owning process is killed', async () => {
+    const service = await fixtureService();
+    const dir = await mkdtemp(join(tmpdir(), 'surflet-killed-owner-'));
+    const configDir = join(dir, 'credentials');
+    const gate = deferred<void>();
+    service.setWorkspaceHook(() => gate.promise);
+    const owner = enrollmentChild(service.base, configDir);
+    await vi.waitFor(() =>
+      expect(service.calls.filter((call) => call === 'POST /api/workspaces')).toHaveLength(1),
+    );
+    const closed = once(owner, 'close');
+    owner.kill('SIGKILL');
+    await closed;
+    gate.resolve();
+    service.setWorkspaceHook();
+    await expect(enrollInChild(service.base, configDir)).resolves.toBeUndefined();
+    expect(service.calls.filter((call) => call === 'POST /api/workspaces')).toHaveLength(2);
+  });
+
+  it('reclaims a credential lock only when its recorded owner is gone', async () => {
+    const service = await fixtureService();
+    const dir = await mkdtemp(join(tmpdir(), 'surflet-dead-lock-'));
+    await saveCredentials({ token: 'old', server: service.base }, dir);
+    const credential = join(dir, (await readdir(dir)).find((file) => file.endsWith('.json'))!);
+    await rm(credential);
+    await writeFile(`${credential}.lock`, JSON.stringify({ pid: 999_999_999, token: 'dead' }), {
+      mode: 0o600,
+    });
+    await expect(workspaceClient(service.base, dir)).resolves.toBeDefined();
+    expect(service.calls.filter((call) => call === 'POST /api/workspaces')).toHaveLength(1);
+  });
+
+  it('recovers an abandoned legacy lock without publishing an incomplete new owner', async () => {
+    const service = await fixtureService();
+    const dir = await mkdtemp(join(tmpdir(), 'surflet-partial-lock-'));
+    await saveCredentials({ token: 'old', server: service.base }, dir);
+    const credential = join(dir, (await readdir(dir)).find((file) => file.endsWith('.json'))!);
+    await rm(credential);
+    await writeFile(`${credential}.lock`, '', { mode: 0o600 });
+    await utimes(`${credential}.lock`, new Date(0), new Date(0));
+    const gate = deferred<void>();
+    service.setWorkspaceHook(() => gate.promise);
+    const pending = workspaceClient(service.base, dir);
+    await vi.waitFor(() => expect(service.calls).toContain('POST /api/workspaces'));
+    const owner = JSON.parse(
+      await (await import('node:fs/promises')).readFile(`${credential}.lock`, 'utf8'),
+    );
+    expect(owner.pid).toBe(process.pid);
+    expect(owner.token).toMatch(/^[a-f0-9]{32}$/);
+    gate.resolve();
+    await pending;
+    expect(
+      (await readdir(dir)).some((file) => file.endsWith('.lock') || file.endsWith('.tmp')),
+    ).toBe(false);
   });
 
   it('hashes changing dirty content and returns unknown when untracked content exceeds capture limits', async () => {
@@ -484,6 +637,280 @@ describe('local connector', () => {
     await handle.close();
   });
 
+  it('closes a canceled upstream even when the local app has not sent response headers', async () => {
+    const accepted = deferred<void>();
+    let upstreamClosed = false;
+    const app = createServer((_request, response) => {
+      response.once('close', () => {
+        upstreamClosed = true;
+      });
+      accepted.resolve();
+    });
+    const appUrl = await listen(app);
+    const service = await fixtureService();
+    const handle = await startShare({
+      server: service.base,
+      port: Number(new URL(appUrl).port),
+      mode: 'local',
+      configDir: await mkdtemp(join(tmpdir(), 'surflet-early-abort-')),
+      reporterScript: '',
+    });
+    closers.unshift(() => handle.close());
+    const access = await handle.client.getAccess(handle.preview.id);
+    const exchange = await fetch(access.targetUrl, { redirect: 'manual' });
+    const cookie = exchange.headers
+      .getSetCookie()
+      .map((value) => value.split(';', 1)[0])
+      .join('; ');
+    const incoming = httpRequest(handle.connectorUrl, { headers: { cookie } });
+    incoming.on('error', () => undefined);
+    incoming.end();
+    await accepted.promise;
+    incoming.destroy();
+    await vi.waitFor(() => expect(upstreamClosed).toBe(true), { timeout: 1000 });
+    await handle.close();
+  });
+
+  it('streams an unknown-length HTML response without buffering it or delaying first bytes', async () => {
+    let upstreamClosed = false;
+    const app = createServer((_request, response) => {
+      response.writeHead(200, { 'content-type': 'text/html' });
+      response.write('<html><body>');
+      response.write(Buffer.alloc(2 * 1024 * 1024 + 1, 120));
+      const timer = setInterval(() => response.write('x'), 10);
+      response.once('close', () => {
+        clearInterval(timer);
+        upstreamClosed = true;
+      });
+    });
+    const appUrl = await listen(app);
+    const service = await fixtureService();
+    const handle = await startShare({
+      server: service.base,
+      port: Number(new URL(appUrl).port),
+      mode: 'local',
+      configDir: await mkdtemp(join(tmpdir(), 'surflet-html-stream-')),
+      reporterScript: '',
+    });
+    const access = await handle.client.getAccess(handle.preview.id);
+    const exchange = await fetch(access.targetUrl, { redirect: 'manual' });
+    const cookie = exchange.headers
+      .getSetCookie()
+      .map((value) => value.split(';', 1)[0])
+      .join('; ');
+    const received = await new Promise<{ first: string; fallback: string | null }>(
+      (resolve, reject) => {
+        const request = httpRequest(
+          `${handle.connectorUrl}/`,
+          { headers: { cookie } },
+          (response) => {
+            response.once('data', (chunk) => {
+              resolve({
+                first: String(chunk),
+                fallback: String(response.headers['x-surflet-reporter'] ?? '') || null,
+              });
+              request.destroy();
+            });
+          },
+        );
+        request.once('error', reject);
+        request.end();
+      },
+    );
+    expect(received.first).toContain('<html><body>');
+    expect(received.fallback).toBe('portal-fallback');
+    await vi.waitFor(() => expect(upstreamClosed).toBe(true));
+    await handle.close();
+  });
+
+  it('falls back promptly for slow chunked HTML and closes its upstream when the viewer leaves', async () => {
+    let upstreamClosed = false;
+    const app = createServer((_request, response) => {
+      response.writeHead(200, { 'content-type': 'text/html' });
+      response.write('<html><body>Loading');
+      const timer = setInterval(() => response.write('.'), 40);
+      response.once('close', () => {
+        clearInterval(timer);
+        upstreamClosed = true;
+      });
+    });
+    const appUrl = await listen(app);
+    const service = await fixtureService();
+    const handle = await startShare({
+      server: service.base,
+      port: Number(new URL(appUrl).port),
+      mode: 'local',
+      configDir: await mkdtemp(join(tmpdir(), 'surflet-slow-html-')),
+      reporterScript: '',
+    });
+    const access = await handle.client.getAccess(handle.preview.id);
+    const exchange = await fetch(access.targetUrl, { redirect: 'manual' });
+    const cookie = exchange.headers
+      .getSetCookie()
+      .map((value) => value.split(';', 1)[0])
+      .join('; ');
+    const started = Date.now();
+    const first = await new Promise<{ text: string; elapsed: number }>((resolve, reject) => {
+      const request = httpRequest(
+        `${handle.connectorUrl}/`,
+        { headers: { cookie } },
+        (response) => {
+          response.once('data', (chunk) => {
+            resolve({ text: String(chunk), elapsed: Date.now() - started });
+            request.destroy();
+          });
+        },
+      );
+      request.once('error', reject);
+      request.end();
+    });
+    expect(first.text).toContain('Loading');
+    expect(first.elapsed).toBeLessThan(250);
+    await vi.waitFor(() => expect(upstreamClosed).toBe(true));
+    await handle.close();
+  });
+
+  it('rejects malformed WebSocket protocol headers without killing the proxy', async () => {
+    let upstreamUpgrades = 0;
+    const app = createServer((_request, response) => response.end('ok'));
+    app.on('upgrade', (_request, socket) => {
+      upstreamUpgrades += 1;
+      socket.destroy();
+    });
+    const appUrl = await listen(app);
+    const service = await fixtureService();
+    const handle = await startShare({
+      server: service.base,
+      port: Number(new URL(appUrl).port),
+      mode: 'local',
+      configDir: await mkdtemp(join(tmpdir(), 'surflet-ws-header-')),
+      reporterScript: '',
+    });
+    const access = await handle.client.getAccess(handle.preview.id);
+    const exchange = await fetch(access.targetUrl, { redirect: 'manual' });
+    const cookie = exchange.headers
+      .getSetCookie()
+      .map((value) => value.split(';', 1)[0])
+      .join('; ');
+    const malformed = await new Promise<number>((resolve, reject) => {
+      const request = httpRequest(handle.connectorUrl, {
+        headers: {
+          connection: 'Upgrade',
+          upgrade: 'websocket',
+          'sec-websocket-version': '13',
+          'sec-websocket-key': Buffer.alloc(16).toString('base64'),
+          'sec-websocket-protocol': 'bad protocol',
+          cookie,
+          origin: handle.connectorUrl,
+        },
+      });
+      request.once('upgrade', (_response, socket) => {
+        socket.destroy();
+        reject(new Error('malformed protocol upgraded'));
+      });
+      request.once('response', (response) => {
+        response.resume();
+        response.once('end', () => resolve(response.statusCode ?? 0));
+      });
+      request.once('error', reject);
+      request.end();
+    });
+    expect(malformed).toBe(400);
+    for (const invalid of [{ 'sec-websocket-key': 'invalid' }, { 'sec-websocket-version': '12' }]) {
+      const status = await new Promise<number>((resolve, reject) => {
+        const request = httpRequest(handle.connectorUrl, {
+          headers: {
+            connection: 'Upgrade',
+            upgrade: 'websocket',
+            'sec-websocket-version': '13',
+            'sec-websocket-key': Buffer.alloc(16).toString('base64'),
+            cookie,
+            origin: handle.connectorUrl,
+            ...invalid,
+          },
+        });
+        request.once('response', (response) => {
+          response.resume();
+          response.once('end', () => resolve(response.statusCode ?? 0));
+        });
+        request.once('error', reject);
+        request.end();
+      });
+      expect(status).toBe(400);
+    }
+    expect(upstreamUpgrades).toBe(0);
+    expect(
+      await (await fetch(`${handle.connectorUrl}/`, { headers: { cookie } })).text(),
+    ).toContain('ok');
+    await handle.close();
+  });
+
+  it('bounds sequential ticket exchanges while keeping existing sessions usable', async () => {
+    const app = createServer((_request, response) => response.end('ok'));
+    const appUrl = await listen(app);
+    const service = await fixtureService();
+    const handle = await startShare({
+      server: service.base,
+      port: Number(new URL(appUrl).port),
+      mode: 'local',
+      configDir: await mkdtemp(join(tmpdir(), 'surflet-sessions-')),
+      reporterScript: '',
+    });
+    const access = await handle.client.getAccess(handle.preview.id);
+    const first = await fetch(access.targetUrl, { redirect: 'manual' });
+    expect(first.status).toBe(302);
+    const cookie = first.headers
+      .getSetCookie()
+      .map((value) => value.split(';', 1)[0])
+      .join('; ');
+    for (let index = 0; index < 105; index += 1) {
+      const reused = await fetch(access.targetUrl, { redirect: 'manual', headers: { cookie } });
+      expect(reused.status).toBe(302);
+      expect(reused.headers.getSetCookie()).toHaveLength(0);
+    }
+    for (let index = 0; index < 99; index += 1) {
+      const exchanged = await fetch(access.targetUrl, { redirect: 'manual' });
+      expect(exchanged.status).toBe(302);
+    }
+    const reopened = await fetch(access.targetUrl, { redirect: 'manual', headers: { cookie } });
+    expect(reopened.status).toBe(302);
+    expect(reopened.headers.getSetCookie()).toHaveLength(0);
+    expect((await fetch(access.targetUrl, { redirect: 'manual' })).status).toBe(429);
+    expect(
+      await (await fetch(`${handle.connectorUrl}/`, { headers: { cookie } })).text(),
+    ).toContain('ok');
+    await handle.close();
+  });
+
+  it('reserves the final session slot across concurrent ticket exchanges', async () => {
+    const app = createServer((_request, response) => response.end('ok'));
+    const appUrl = await listen(app);
+    const service = await fixtureService();
+    const handle = await startShare({
+      server: service.base,
+      port: Number(new URL(appUrl).port),
+      mode: 'local',
+      configDir: await mkdtemp(join(tmpdir(), 'surflet-session-race-')),
+      reporterScript: '',
+    });
+    const access = await handle.client.getAccess(handle.preview.id);
+    for (let index = 0; index < 99; index += 1)
+      expect((await fetch(access.targetUrl, { redirect: 'manual' })).status).toBe(302);
+    const gate = deferred<void>();
+    service.setExchangeHook(() => gate.promise);
+    const first = fetch(access.targetUrl, { redirect: 'manual' });
+    await vi.waitFor(() =>
+      expect(
+        service.calls.filter((call) => call === 'POST /api/previews/preview-1/exchange'),
+      ).toHaveLength(100),
+    );
+    const second = await fetch(access.targetUrl, { redirect: 'manual' });
+    expect(second.status).toBe(429);
+    gate.resolve();
+    expect((await first).status).toBe(302);
+    await handle.close();
+  });
+
   it('stops the preview when a ready Quick Tunnel exits', async () => {
     vi.spyOn(publicReadiness, 'waitForQuickTunnel').mockResolvedValue();
     const app = createServer((_request, response) => response.end('ok'));
@@ -525,6 +952,74 @@ describe('local connector', () => {
     ).toHaveLength(1);
     expect(killed).toBe(true);
     await handle.close();
+  });
+
+  it('waits for the assigned named origin, drains tunnel output, and rolls back on tunnel failure', async () => {
+    const service = await fixtureService();
+    const child = new EventEmitter() as ChildProcess;
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    Object.assign(child, {
+      stdout,
+      stderr,
+      kill: () => {
+        queueMicrotask(() => child.emit('close', 0, 'SIGTERM'));
+        return true;
+      },
+    });
+    const resume = vi.spyOn(stdout, 'resume');
+    const ready = deferred<void>();
+    vi.spyOn(publicReadiness, 'waitForPublicTunnel').mockReturnValue(ready.promise);
+    const sharing = startShare({
+      server: service.base,
+      port: 3000,
+      mode: 'named',
+      revision: 'named',
+      configDir: await mkdtemp(join(tmpdir(), 'surflet-named-')),
+      reporterScript: '',
+      spawnProcess: (() => child) as typeof spawn,
+    });
+    await vi.waitFor(() =>
+      expect(publicReadiness.waitForPublicTunnel).toHaveBeenCalledWith(
+        'https://preview-1.preview.example',
+        expect.any(AbortSignal),
+      ),
+    );
+    expect(resume).toHaveBeenCalled();
+    ready.resolve();
+    const handle = await sharing;
+    expect(handle.connectorUrl).toBe('https://preview-1.preview.example');
+    await handle.close();
+
+    const failed = new EventEmitter() as ChildProcess;
+    Object.assign(failed, {
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+      kill: () => {
+        queueMicrotask(() => failed.emit('close', 0, 'SIGTERM'));
+        return true;
+      },
+    });
+    vi.spyOn(publicReadiness, 'waitForPublicTunnel').mockImplementation(
+      () => new Promise<void>(() => undefined),
+    );
+    const rejected = startShare({
+      server: service.base,
+      port: 3000,
+      mode: 'named',
+      revision: 'named',
+      configDir: await mkdtemp(join(tmpdir(), 'surflet-named-failed-')),
+      reporterScript: '',
+      spawnProcess: (() => failed) as typeof spawn,
+    });
+    await vi.waitFor(() =>
+      expect(
+        service.calls.filter((call) => call === 'POST /api/previews/preview-1/named-tunnel'),
+      ).toHaveLength(2),
+    );
+    failed.emit('error', new Error('ENOENT'));
+    await expect(rejected).rejects.toThrow('cloudflared failed');
+    expect(service.calls.filter((call) => call.endsWith('/stop'))).toHaveLength(2);
   });
 
   it('waits for public readiness before publishing a Quick share and cancels pending startup', async () => {
